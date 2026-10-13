@@ -14,10 +14,9 @@ st.set_page_config(page_title="Agri Farmer Card Portal", layout="centered", page
 ADMIN_USERNAME = st.secrets.get("AUTH_USER", "admin")
 ADMIN_PASSWORD = st.secrets.get("AUTH_PASS", "agri@123")
 
-# Filename of your logo stored in the same repository folder
 LOGO_FILENAME = "logo.png"
 
-# Initialize session state variables
+# Session state initialization
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 
@@ -75,45 +74,45 @@ def parse_agristack_pdf(pdf_bytes):
         return match.group(group).strip() if match else ""
 
     # Basic Details
-    farmer_id = clean_search(r"Farmer ID:\s*(\d+)", full_text) or "40307570637"[cite: 13]
-    name_en = clean_search(r"Farmer Name as per Aadhaar in English\s*([^|\n]+)", full_text) or "Pramod Ashok Phatangare"[cite: 13]
+    farmer_id = clean_search(r"Farmer ID:\s*(\d+)", full_text) or "40307570637"
+    name_en = clean_search(r"Farmer Name as per Aadhaar in English\s*([^|\n]+)", full_text) or "Pramod Ashok Phatangare"
 
-    name_mr_match = re.search(r"Farmer's Name in Local Language\s*([^|\n]+(?:\s*\|\s*[^|\n]+|\n[^\n|]+)?)", full_text)[cite: 13]
+    name_mr_match = re.search(r"Farmer's Name in Local Language\s*([^|\n]+(?:\s*\|\s*[^|\n]+|\n[^\n|]+)?)", full_text)
     name_mr = ""
     if name_mr_match:
         name_mr = " ".join(name_mr_match.group(1).replace("|", " ").split())
     else:
-        name_mr = "प्रमोद अशोक फटांगरे"[cite: 13]
+        name_mr = "प्रमोद अशोक फटांगरे"
 
-    dob = clean_search(r"Date of Birth\s*(\d{2}/\d{2}/\d{4})", full_text) or "28/09/1992"[cite: 13]
-    gender = clean_search(r"Gender\s*([A-Za-z]+)", full_text) or "Male"[cite: 13]
-    mobile = clean_search(r"Mobile Number\s*(\d{10})", full_text) or "9730306032"[cite: 13]
+    dob = clean_search(r"Date of Birth\s*(\d{2}/\d{2}/\d{4})", full_text) or "28/09/1992"
+    gender = clean_search(r"Gender\s*([A-Za-z]+)", full_text) or "Male"
+    mobile = clean_search(r"Mobile Number\s*(\d{10})", full_text) or "9730306032"
 
     # Addresses
-    addr_en_match = re.search(r"Address In English\s*(.*?)\s*Address In Local Language", full_text, re.DOTALL)[cite: 14]
+    addr_en_match = re.search(r"Address In English\s*(.*?)\s*Address In Local Language", full_text, re.DOTALL)
     if addr_en_match:
         address_en = " ".join(addr_en_match.group(1).replace("\n", " ").split())
     else:
-        address_en = clean_search(r"Address In English\s*([^|\n]+)", full_text) or "S NO.26/6B, FLAT NO.401 SWAMI SAMARATH APARTMENT ,GANESH NAGAR ,PIMPALE GURAV, HAVELI"[cite: 14]
+        address_en = clean_search(r"Address In English\s*([^|\n]+)", full_text) or "S NO.26/6B, FLAT NO.401 SWAMI SAMARATH APARTMENT ,GANESH NAGAR ,PIMPALE GURAV, HAVELI"
 
-    addr_mr_match = re.search(r"Address In Local Language\s*(.*?)\s*(?:Farmer type|Occupations|Land Ownership Details)", full_text, re.DOTALL)[cite: 14]
+    addr_mr_match = re.search(r"Address In Local Language\s*(.*?)\s*(?:Farmer type|Occupations|Land Ownership Details)", full_text, re.DOTALL)
     if addr_mr_match:
         address_mr = " ".join(addr_mr_match.group(1).replace("\n", " ").split())
     else:
-        address_mr = clean_search(r"Address In Local Language\s*([^|\n]+)", full_text) or "एस. नं. 26/6 बी, फ्लैट नं. 401 स्वामी समर्थ विभाग, गणेश नगर, पिम्पले गौरव, हावेली"[cite: 14]
+        address_mr = clean_search(r"Address In Local Language\s*([^|\n]+)", full_text) or "एस. नं. 26/6 बी, फ्लैट नं. 401 स्वामी समर्थ विभाग, गणेश नगर, पिम्पले गौरव, हावेली"
 
     # Land Details
     district_mr = "अहिल्यानगर"
     taluka_mr = "संगमनेर"
     village_mr = "अकलापूर"
-    survey_no = "17"[cite: 14]
-    area = "0.46"[cite: 14]
+    survey_no = "17"
+    area = "0.46"
 
     land_match = re.search(
         r"MAHARA[\s\n]*SHTRA\s*\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*(\d+)\s*\|.*?\|\s*([\d\.]+)",
         full_text,
         re.DOTALL
-    )[cite: 14]
+    )
 
     if land_match:
         dist_raw = "".join(land_match.group(1).split()).upper()
@@ -133,7 +132,7 @@ def parse_agristack_pdf(pdf_bytes):
     # Centered Photo Extraction
     photo_base64 = ""
     try:
-        search_hits = page1.search_for("Farmer Photograph")[cite: 13, 20]
+        search_hits = page1.search_for("Farmer Photograph")
         if search_hits:
             h = search_hits[0]
             clip_rect = fitz.Rect(
@@ -179,10 +178,8 @@ def parse_agristack_pdf(pdf_bytes):
 def get_cards_page_html(data):
     photo_tag = f'<img src="data:image/jpeg;base64,{data["photo_base64"]}" style="width:100%; height:100%; object-fit:cover; object-position:center center; display:block;" />' if data["photo_base64"] else '<div style="background:#eee;width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">No Photo</div>'
     
-    # Aadhaar number formatting
     aadhaar_val = data.get("aadhaar_no", "").strip()
     if aadhaar_val:
-        # Auto-format in 4-4-4 chunks if plain 12 digits
         clean_num = aadhaar_val.replace(" ", "")
         if len(clean_num) == 12:
             aadhaar_display = f"{clean_num[:4]} {clean_num[4:8]} {clean_num[8:]}"
@@ -191,14 +188,12 @@ def get_cards_page_html(data):
     else:
         aadhaar_display = "[Aadhaar Redacted]"
 
-    # Format Farmer ID with spaces for readability in footer (e.g. 4030 7570 637)
     raw_fid = data['farmer_id']
     if len(raw_fid) == 11:
         formatted_fid = f"{raw_fid[:4]} {raw_fid[4:8]} {raw_fid[8:]}"
     else:
         formatted_fid = raw_fid
 
-    # Logo element: use base64 image if exists, else fallback gracefully
     logo_src = get_local_logo_base64()
     if logo_src:
         header_logo_html = f'<img src="{logo_src}" style="height: 38px; width: auto; object-fit: contain; vertical-align: middle;" />'
@@ -240,7 +235,6 @@ def get_cards_page_html(data):
             .qr-box {{ position: absolute; right: 18px; top: 68px; width: 85px; height: 85px; }}
             .qr-box img {{ width: 100%; height: 100%; }}
 
-            /* High-legibility footer with larger fonts */
             .footer {{
                 position: absolute; bottom: 0; left: 0; right: 0;
                 background: #1B4D3E; height: 56px;
@@ -254,7 +248,6 @@ def get_cards_page_html(data):
                 color: #ffffff; font-size: 26px; font-weight: 800; letter-spacing: 2.5px; line-height: 1;
             }}
 
-            /* Back Card */
             .card-back {{ padding: 14px 22px; border: 2px solid #1B4D3E; }}
             .sec-title {{ font-size: 15px; font-weight: 800; color: #1B4D3E; margin-bottom: 2px; }}
             .address-box {{ margin-bottom: 12px; }}
@@ -274,7 +267,6 @@ def get_cards_page_html(data):
         </style>
     </head>
     <body>
-        <!-- FRONT -->
         <div id="card-front" class="card">
             <div class="header">
                 <div>{header_logo_html}</div>
@@ -302,7 +294,6 @@ def get_cards_page_html(data):
             </div>
         </div>
 
-        <!-- BACK -->
         <div id="card-back" class="card card-back">
             <div class="sec-title">संपूर्ण पत्ता / Address</div>
             <div class="address-box">
@@ -411,7 +402,6 @@ def main_dashboard():
 
         submitted = st.form_submit_button("Generate Card")
 
-    # Generate only when form is submitted
     if submitted:
         if uploaded_file is None:
             st.error("Please upload the registration PDF first.")
@@ -428,7 +418,6 @@ def main_dashboard():
                 st.session_state["card_back"] = back_png
                 st.session_state["farmer_data"] = farmer_data
 
-    # Display results from session state
     if st.session_state["card_front"] is not None and st.session_state["card_back"] is not None:
         data = st.session_state["farmer_data"]
         st.success(f"Card ready for: **{data['name_mr']}** ({data['name_en']})")
@@ -456,7 +445,6 @@ def main_dashboard():
                 key="btn_download_back"
             )
 
-# App entry
 if not st.session_state["authenticated"]:
     login_page()
 else:
