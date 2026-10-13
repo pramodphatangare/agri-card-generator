@@ -20,10 +20,27 @@ if "authenticated" not in st.session_state:
 
 # ----------------- 2. BROWSER INSTANCE CACHE -----------------
 
+import subprocess
+
 @st.cache_resource
 def get_browser_instance():
+    # Ensure Chromium binaries are present on the cloud container
+    try:
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+    except Exception as e:
+        pass
+
     p = sync_playwright().start()
-    browser = p.chromium.launch(headless=True)
+    browser = p.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--single-process"
+        ]
+    )
     return p, browser
 
 # ----------------- 3. LOCAL QR GENERATION -----------------
