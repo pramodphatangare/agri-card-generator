@@ -6,7 +6,19 @@ import qrcode
 from playwright.sync_api import sync_playwright
 import streamlit as st
 
-# ----------------- 1. BROWSER INSTANCE -----------------
+# ----------------- 1. APP CONFIGURATION & CREDENTIALS -----------------
+
+st.set_page_config(page_title="Agri Farmer Card Portal", layout="centered", page_icon="🌾")
+
+# Set your portal login credentials (can also be read from st.secrets)
+ADMIN_USERNAME = st.secrets.get("AUTH_USER", "admin")
+ADMIN_PASSWORD = st.secrets.get("AUTH_PASS", "agri@123")
+
+# Initialize session state for login
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
+# ----------------- 2. BROWSER INSTANCE CACHE -----------------
 
 @st.cache_resource
 def get_browser_instance():
@@ -14,7 +26,7 @@ def get_browser_instance():
     browser = p.chromium.launch(headless=True)
     return p, browser
 
-# ----------------- 2. LOCAL QR ENGINE -----------------
+# ----------------- 3. LOCAL QR GENERATION -----------------
 
 def generate_local_qr_base64(data_text):
     qr = qrcode.QRCode(
@@ -31,7 +43,7 @@ def generate_local_qr_base64(data_text):
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-# ----------------- 3. PDF EXTRACTION ENGINE -----------------
+# ----------------- 4. PDF EXTRACTION ENGINE -----------------
 
 def parse_agristack_pdf(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -44,7 +56,6 @@ def parse_agristack_pdf(pdf_bytes):
         match = re.search(pattern, text, re.IGNORECASE)
         return match.group(group).strip() if match else ""
 
-    # Basic Details
     farmer_id = clean_search(r"Farmer ID:\s*(\d+)", full_text) or "40307570637"
     name_en = clean_search(r"Farmer Name as per Aadhaar in English\s*([^|\n]+)", full_text) or "Pramod Ashok Phatangare"
 
@@ -59,7 +70,6 @@ def parse_agristack_pdf(pdf_bytes):
     gender = clean_search(r"Gender\s*([A-Za-z]+)", full_text) or "Male"
     mobile = clean_search(r"Mobile Number\s*(\d{10})", full_text) or "9730306032"
 
-    # Addresses
     addr_en_match = re.search(r"Address In English\s*(.*?)\s*Address In Local Language", full_text, re.DOTALL)
     if addr_en_match:
         address_en = " ".join(addr_en_match.group(1).replace("\n", " ").split())
@@ -72,7 +82,6 @@ def parse_agristack_pdf(pdf_bytes):
     else:
         address_mr = clean_search(r"Address In Local Language\s*([^|\n]+)", full_text) or "एस. नं. 26/6 बी, फ्लैट नं. 401 स्वामी समर्थ विभाग, गणेश नगर, पिम्पले गौरव, हावेली"
 
-    # Land Details
     district_mr = "अहिल्यानगर"
     taluka_mr = "संगमनेर"
     village_mr = "अकलापूर"
@@ -106,12 +115,7 @@ def parse_agristack_pdf(pdf_bytes):
         search_hits = page1.search_for("Farmer Photograph")
         if search_hits:
             h = search_hits[0]
-            clip_rect = fitz.Rect(
-                h.x0 + 66,       # Centered left boundary
-                h.y1 + 32,       # Clean vertical start
-                h.x0 + 132,      # Symmetric right boundary
-                h.y1 + 104       # Full collar and face height
-            )
+            clip_rect = fitz.Rect(h.x0 + 66, h.y1 + 32, h.x0 + 132, h.y1 + 104)
             pix = page1.get_pixmap(clip=clip_rect, dpi=300)
             photo_base64 = base64.b64encode(pix.tobytes("jpeg")).decode("utf-8")
         else:
@@ -121,9 +125,8 @@ def parse_agristack_pdf(pdf_bytes):
             pix = page1.get_pixmap(clip=clip_rect, dpi=300)
             photo_base64 = base64.b64encode(pix.tobytes("jpeg")).decode("utf-8")
     except Exception as e:
-        st.warning(f"Photo extraction error: {e}")
+        st.warning(f"Photo extraction notice: {e}")
 
-    # Local QR Generation
     qr_payload = f"FarmerID:{farmer_id}|Name:{name_en}"
     qr_base64 = generate_local_qr_base64(qr_payload)
 
@@ -145,11 +148,10 @@ def parse_agristack_pdf(pdf_bytes):
         "qr_base64": qr_base64
     }
 
-# ----------------- 4. COMBINED CARD HTML -----------------
+# ----------------- 5. CARD HTML TEMPLATE -----------------
 
 def get_cards_page_html(data):
     photo_tag = f'<img src="data:image/jpeg;base64,{data["photo_base64"]}" style="width:100%; height:100%; object-fit:cover; object-position:center center; display:block;" />' if data["photo_base64"] else '<div style="background:#eee;width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">No Photo</div>'
-    
     aadhaar_display = data.get("aadhaar_no", "").strip() or "[Aadhaar Redacted]"
 
     return f"""
@@ -160,7 +162,6 @@ def get_cards_page_html(data):
         <style>
             * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: 'Mukta', sans-serif; }}
             body {{ background: transparent; padding: 10px; display: flex; flex-direction: column; gap: 20px; }}
-            
             .card {{
                 width: 506px; height: 319px; background: #ffffff;
                 position: relative; overflow: hidden; border: 1.5px solid #1B4D3E; border-radius: 10px;
@@ -191,8 +192,6 @@ def get_cards_page_html(data):
             }}
             .footer-text {{ color: #F9A825; font-size: 22px; font-weight: 800; }}
             .footer-id {{ color: #ffffff; font-size: 23px; font-weight: 800; letter-spacing: 2px; }}
-
-            /* Back Card */
             .card-back {{ padding: 14px 22px; border: 2px solid #1B4D3E; }}
             .sec-title {{ font-size: 15px; font-weight: 800; color: #1B4D3E; margin-bottom: 2px; }}
             .address-box {{ margin-bottom: 12px; }}
@@ -212,15 +211,12 @@ def get_cards_page_html(data):
         </style>
     </head>
     <body>
-        <!-- FRONT -->
         <div id="card-front" class="card">
             <div class="header">
                 <span class="header-title">Agri record &nbsp; फार्मर आयडी कार्ड</span>
             </div>
             <div class="content">
-                <div class="photo-box">
-                    {photo_tag}
-                </div>
+                <div class="photo-box">{photo_tag}</div>
                 <div class="details">
                     <div><span class="field-label">नाव :</span> <span class="name-mr">{data['name_mr']}</span></div>
                     <div class="name-en" style="padding-left: 38px;">{data['name_en']}</div>
@@ -229,9 +225,7 @@ def get_cards_page_html(data):
                     <div class="field-row"><span class="field-label">मोबाइल / Mobile :</span> {data['mobile']}</div>
                     <div class="field-row"><span class="field-label">आधार नं / Aadhaar No :</span> {aadhaar_display}</div>
                 </div>
-                <div class="qr-box">
-                    <img src="data:image/png;base64,{data['qr_base64']}" />
-                </div>
+                <div class="qr-box"><img src="data:image/png;base64,{data['qr_base64']}" /></div>
             </div>
             <div class="footer">
                 <span class="footer-text">फार्मर आयडी</span>
@@ -239,14 +233,12 @@ def get_cards_page_html(data):
             </div>
         </div>
 
-        <!-- BACK -->
         <div id="card-back" class="card card-back">
             <div class="sec-title">संपूर्ण पत्ता / Address</div>
             <div class="address-box">
                 <div class="address-mr">{data['address_mr']}</div>
                 <div class="address-en">{data['address_en']}</div>
             </div>
-
             <div class="sec-title">जमिनीची माहिती / Land Details</div>
             <table class="table-container">
                 <thead>
@@ -270,15 +262,13 @@ def get_cards_page_html(data):
                     </tr>
                 </tbody>
             </table>
-            <div class="disclaimer">
-                This card is only for personal use not for Govt. identity
-            </div>
+            <div class="disclaimer">This card is only for personal use not for Govt. identity</div>
         </div>
     </body>
     </html>
     """
 
-# ----------------- 5. FAST RENDER FUNCTION -----------------
+# ----------------- 6. RENDER ENGINE -----------------
 
 def render_cards_fast(html_content):
     _, browser = get_browser_instance()
@@ -289,58 +279,89 @@ def render_cards_fast(html_content):
     page.close()
     return front_bytes, back_bytes
 
-# ----------------- 6. STREAMLIT APPLICATION -----------------
+# ----------------- 7. UI ROUTING (LOGIN vs APPLICATION) -----------------
 
-st.set_page_config(page_title="Agri Farmer Card Generator", layout="centered")
-st.title("🌾 Agri Farmer ID Card Generator")
-st.write("Upload your registration PDF, enter the Aadhaar number, and press **Enter**.")
+def login_page():
+    st.markdown("<h2 style='text-align: center;'>🔐 Operator Login</h2>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #666;'>Agri Farmer Card Generation Portal</p>", unsafe_allow_html=True)
+    
+    with st.form("login_form"):
+        username = st.text_input("Username", placeholder="Enter username")
+        password = st.text_input("Password", type="password", placeholder="Enter password")
+        submit = st.form_submit_button("Sign In")
 
-with st.form("card_generation_form", clear_on_submit=False):
-    col_file, col_input = st.columns([2, 1])
+        if submit:
+            if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+                st.session_state["authenticated"] = True
+                st.success("Login successful!")
+                st.rerun()
+            else:
+                st.error("Invalid Username or Password.")
 
-    with col_file:
-        uploaded_file = st.file_uploader("Upload Registration PDF", type=["pdf"])
+def main_dashboard():
+    # Header with sign out
+    col_title, col_logout = st.columns([5, 1])
+    with col_title:
+        st.title("🌾 Agri Farmer ID Card Generator")
+    with col_logout:
+        if st.button("Sign Out"):
+            st.session_state["authenticated"] = False
+            st.rerun()
 
-    with col_input:
-        user_aadhaar = st.text_input(
-            "Aadhaar Number",
-            placeholder="Enter number",
-            max_chars=14
-        )
+    st.write("Upload your registration PDF, enter the Aadhaar number, and press **Enter**.")
 
-    submitted = st.form_submit_button("Generate Card")
+    with st.form("card_generation_form", clear_on_submit=False):
+        col_file, col_input = st.columns([2, 1])
 
-if submitted:
-    if uploaded_file is None:
-        st.error("Please upload the registration PDF first.")
-    else:
-        with st.spinner("Generating cards..."):
-            pdf_bytes = uploaded_file.read()
-            farmer_data = parse_agristack_pdf(pdf_bytes)
-            farmer_data["aadhaar_no"] = user_aadhaar
+        with col_file:
+            uploaded_file = st.file_uploader("Upload Registration PDF", type=["pdf"])
 
-            full_html = get_cards_page_html(farmer_data)
-            front_png, back_png = render_cards_fast(full_html)
+        with col_input:
+            user_aadhaar = st.text_input(
+                "Aadhaar Number",
+                placeholder="Enter number",
+                max_chars=14
+            )
 
-            st.success(f"Generated card for: **{farmer_data['name_mr']}**")
+        submitted = st.form_submit_button("Generate Card")
 
-            col1, col2 = st.columns(2)
-            with col1:
-                st.subheader("Front Side")
-                st.image(front_png, use_container_width=True)
-                st.download_button(
-                    label="Download Front",
-                    data=front_png,
-                    file_name=f"{farmer_data['farmer_id']}_front.png",
-                    mime="image/png"
-                )
+    if submitted:
+        if uploaded_file is None:
+            st.error("Please upload the registration PDF first.")
+        else:
+            with st.spinner("Generating cards..."):
+                pdf_bytes = uploaded_file.read()
+                farmer_data = parse_agristack_pdf(pdf_bytes)
+                farmer_data["aadhaar_no"] = user_aadhaar
 
-            with col2:
-                st.subheader("Back Side")
-                st.image(back_png, use_container_width=True)
-                st.download_button(
-                    label="Download Back",
-                    data=back_png,
-                    file_name=f"{farmer_data['farmer_id']}_back.png",
-                    mime="image/png"
-                )
+                full_html = get_cards_page_html(farmer_data)
+                front_png, back_png = render_cards_fast(full_html)
+
+                st.success(f"Generated card for: **{farmer_data['name_mr']}**")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.subheader("Front Side")
+                    st.image(front_png, use_container_width=True)
+                    st.download_button(
+                        label="Download Front",
+                        data=front_png,
+                        file_name=f"{farmer_data['farmer_id']}_front.png",
+                        mime="image/png"
+                    )
+
+                with col2:
+                    st.subheader("Back Side")
+                    st.image(back_png, use_container_width=True)
+                    st.download_button(
+                        label="Download Back",
+                        data=back_png,
+                        file_name=f"{farmer_data['farmer_id']}_back.png",
+                        mime="image/png"
+                    )
+
+# Gatekeeper logic
+if not st.session_state["authenticated"]:
+    login_page()
+else:
+    main_dashboard()
