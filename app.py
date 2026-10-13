@@ -290,7 +290,12 @@ def get_cards_page_html(data):
 def render_cards_fast(html_content):
     _, browser = get_browser_instance()
     page = browser.new_page(viewport={"width": 600, "height": 800}, device_scale_factor=2)
-    page.set_content(html_content, wait_until="domcontentloaded")
+    
+    # Load content and wait for network and font assets
+    page.set_content(html_content, wait_until="networkidle")
+    # Explicitly ensure all font faces are loaded and rendered
+    page.evaluate("document.fonts.ready")
+    
     front_bytes = page.locator("#card-front").screenshot()
     back_bytes = page.locator("#card-back").screenshot()
     page.close()
