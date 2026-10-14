@@ -495,4 +495,52 @@ def main_dashboard():
         submitted = st.form_submit_button("Generate Card")
 
     if submitted:
-        if uploaded
+        if uploaded_file is None:
+            st.error("Please upload the registration PDF first.")
+        else:
+            with st.spinner("Processing PDF and generating cards..."):
+                pdf_bytes = uploaded_file.getvalue()
+                farmer_data = parse_agristack_pdf(pdf_bytes)
+                farmer_data["aadhaar_no"] = user_aadhaar
+
+                full_html = get_cards_page_html(farmer_data)
+                front_png, back_png = render_cards_fast(full_html)
+
+                st.session_state["card_front"] = front_png
+                st.session_state["card_back"] = back_png
+                st.session_state["farmer_data"] = farmer_data
+
+    if st.session_state["card_front"] is not None and st.session_state["card_back"] is not None:
+        data = st.session_state["farmer_data"]
+        st.success(f"Card ready for: **{data['name_mr']}** ({data['name_en']})")
+
+        with st.expander("🔍 View Extracted Fields (Diagnostics)"):
+            st.json({k: v for k, v in data.items() if k not in ["photo_base64", "qr_base64"]})
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Front Side")
+            st.image(st.session_state["card_front"], use_container_width=True)
+            st.download_button(
+                label="Download Front",
+                data=st.session_state["card_front"],
+                file_name=f"{data['farmer_id']}_front.png",
+                mime="image/png",
+                key="btn_download_front"
+            )
+
+        with col2:
+            st.subheader("Back Side")
+            st.image(st.session_state["card_back"], use_container_width=True)
+            st.download_button(
+                label="Download Back",
+                data=st.session_state["card_back"],
+                file_name=f"{data['farmer_id']}_back.png",
+                mime="image/png",
+                key="btn_download_back"
+            )
+
+if not st.session_state["authenticated"]:
+    login_page()
+else:
+    main_dashboard()
