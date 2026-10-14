@@ -93,7 +93,6 @@ def detect_and_crop_photo_ocr(page):
         img = Image.open(io.BytesIO(pix.tobytes("png")))
         img_w, img_h = img.size
 
-        # Use OCR to get positional bounding boxes of all words
         ocr_data = pytesseract.image_to_data(img, output_type=Output.DICT, lang="eng")
         
         target_x, target_y, target_w, target_h = None, None, None, None
@@ -106,12 +105,10 @@ def detect_and_crop_photo_ocr(page):
             w = ocr_data['width'][i]
             h = ocr_data['height'][i]
 
-            # We are looking for "photograph" or "photo" in the top-right quadrant
             if ("photo" in text or "graph" in text) and x > (img_w * 0.65) and y < (img_h * 0.40):
                 target_x, target_y, target_w, target_h = x, y, w, h
                 break
 
-        # Fallback check for the word "farmer" in the top-right if "photograph" was missed
         if target_x is None:
             for i in range(n_boxes):
                 text = ocr_data['text'][i].strip().lower()
@@ -123,14 +120,9 @@ def detect_and_crop_photo_ocr(page):
                     target_x, target_y, target_w, target_h = x, y, w, h
                     break
 
-        # If detected via OCR coordinates
         if target_x is not None:
-            # Crop box positioned directly below the detected text
-            # Add a small buffer to avoid cutting the top border
             crop_top = target_y + target_h + int(img_h * 0.012)
-            # Standard passport height in this layout is ~13-14% of page height
             crop_bottom = crop_top + int(img_h * 0.135)
-            # Center the crop width relative to the label
             center_x = target_x + (target_w // 2)
             half_box_w = int(img_w * 0.048)
             crop_left = max(0, center_x - half_box_w)
@@ -141,7 +133,6 @@ def detect_and_crop_photo_ocr(page):
             cropped.save(buf, format="JPEG")
             return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-        # Proportional fallback if OCR box was not found
         clip_rect = fitz.Rect(page.rect.width * 0.880, page.rect.height * 0.205, page.rect.width * 0.980, page.rect.height * 0.380)
         fallback_pix = page.get_pixmap(clip=clip_rect, dpi=300)
         return base64.b64encode(fallback_pix.tobytes("jpeg")).decode("utf-8")
@@ -567,7 +558,7 @@ def main_dashboard():
     if uploaded_file is not None:
         file_bytes = uploaded_file.getvalue()
         if st.session_state["last_processed_file"] != uploaded_file.name:
-            with st.spinner("Locating farmer photo with OCR and extracting land parcels..."):
+            with st.spinner("Locating farmer photo and extracting land parcels..."):
                 parsed = parse_agristack_pdf(file_bytes)
                 st.session_state["extracted_data"] = parsed
                 st.session_state["last_processed_file"] = uploaded_file.name
@@ -580,7 +571,7 @@ def main_dashboard():
         d = st.session_state["extracted_data"]
         st.markdown("---")
         st.markdown("### ✏️ Step 2: Verify & Edit Card Details")
-        st.caption("You can modify text fields, adjust/replace the photo, or edit the land records below.")
+        st.caption("You can modify text fields, replace the photo if needed, or edit land records below.")
 
         with st.form("card_edit_form"):
             col_front_form, col_back_form = st.columns(2)
@@ -595,22 +586,13 @@ def main_dashboard():
                 val_mobile = st.text_input("Mobile Number", value=d.get("mobile", ""))
                 val_aadhaar = st.text_input("Aadhaar Number", value=d.get("aadhaar_no", ""), placeholder="Enter 12-digit number")
 
-                # Photo Management & Interactive 4-Way Fine-Tuning
-                st.markdown("##### 📷 Photo Preview & Fine-Tune")
+                # Photo Preview & Optional Manual Replacement
+                st.markdown("##### 📷 Photo Preview")
                 current_photo = d.get("photo_base64", "")
                 if current_photo:
                     st.image(f"data:image/jpeg;base64,{current_photo}", width=120)
 
                 custom_photo_file = st.file_uploader("Replace Photo (Optional)", type=["jpg", "jpeg", "png"])
-                
-                st.caption("Fine-tune crop offsets (Trim excess border or adjust centering):")
-                p_c1, p_c2 = st.columns(2)
-                with p_c1:
-                    trim_top = st.slider("Trim Top (%)", min_value=0, max_value=30, value=0)
-                    trim_bottom = st.slider("Trim Bottom (%)", min_value=0, max_value=30, value=0)
-                with p_c2:
-                    trim_left = st.slider("Trim Left (%)", min_value=0, max_value=30, value=0)
-                    trim_right = st.slider("Trim Right (%)", min_value=0, max_value=30, value=0)
 
             with col_back_form:
                 st.markdown("#### 🏡 Back Card Fields")
@@ -645,26 +627,8 @@ def main_dashboard():
             with st.spinner("Rendering ID cards..."):
                 final_photo_b64 = current_photo
 
-                # If user uploaded a new replacement photo
                 if custom_photo_file is not None:
                     final_photo_b64 = base64.b64encode(custom_photo_file.getvalue()).decode("utf-8")
-                elif current_photo and (trim_top > 0 or trim_bottom > 0 or trim_left > 0 or trim_right > 0):
-                    # Apply 4-way manual crop fine-tuning
-                    try:
-                        raw_img = Image.open(io.BytesIO(base64.b64decode(current_photo)))
-                        w_img, h_img = raw_img.size
-                        crop_box = (
-                            int((trim_left / 100.0) * w_img),
-                            int((trim_top / 100.0) * h_img),
-                            int(w_img - ((trim_right / 100.0) * w_img)),
-                            int(h_img - ((trim_bottom / 100.0) * h_img))
-                        )
-                        cropped = raw_img.crop(crop_box)
-                        buf = io.BytesIO()
-                        cropped.save(buf, format="JPEG")
-                        final_photo_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-                    except Exception:
-                        pass
 
                 updated_land_records = edited_df_land.to_dict(orient="records")
 
