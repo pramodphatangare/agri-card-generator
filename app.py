@@ -13,7 +13,7 @@ import streamlit as st
 
 # ----------------- 1. APP CONFIGURATION & CREDENTIALS -----------------
 
-st.set_page_config(page_title="Agri Farmer Card Portal", layout="centered", page_icon="🌾")
+st.set_page_config(page_title="Agri Farmer Card Portal", layout="wide", page_icon="🌾")
 
 ADMIN_USERNAME = st.secrets.get("AUTH_USER", "admin")
 ADMIN_PASSWORD = st.secrets.get("AUTH_PASS", "agri@123")
@@ -24,20 +24,23 @@ LOGO_FILENAME = "logo.png"
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 
+if "extracted_data" not in st.session_state:
+    st.session_state["extracted_data"] = None
+
 if "card_front" not in st.session_state:
     st.session_state["card_front"] = None
 
 if "card_back" not in st.session_state:
     st.session_state["card_back"] = None
 
-if "farmer_data" not in st.session_state:
-    st.session_state["farmer_data"] = None
+if "last_processed_file" not in st.session_state:
+    st.session_state["last_processed_file"] = None
 
 # ----------------- 2. CONTAINER STARTUP SETUP -----------------
 
 @st.cache_resource
 def ensure_environment_ready():
-    """Installs Chromium binaries on the container if missing."""
+    """Installs Chromium binaries on the cloud container if missing."""
     try:
         subprocess.run(["playwright", "install", "chromium"], check=True)
     except Exception:
@@ -78,7 +81,6 @@ def generate_local_qr_base64(data_text):
 # ----------------- 4. HYBRID OCR & ACCURATE PARSER -----------------
 
 def extract_text_hybrid(doc):
-    """Extracts digital text or runs OCR on scanned pages."""
     text_chunks = [page.get_text("text") for page in doc]
     full_text = "\n".join(text_chunks).strip()
 
@@ -106,8 +108,8 @@ def parse_agristack_pdf(pdf_bytes):
 
     full_text = extract_text_hybrid(doc)
 
-    # 1. Farmer ID (11 digits)
-    farmer_id = "-"
+    # 1. Farmer ID
+    farmer_id = ""
     fid_match = re.search(r"Farmer ID[\s\S]{0,120}?(\d{11})", full_text, re.IGNORECASE)
     if fid_match:
         farmer_id = fid_match.group(1).strip()
@@ -125,33 +127,32 @@ def parse_agristack_pdf(pdf_bytes):
     # Marathi tokens only
     mr_tokens = re.findall(r"[\u0900-\u097F]+", details_block)
     filtered_mr = [w for w in mr_tokens if w not in ["शेतकऱ्याचे", "नाव", "स्थानिक", "भाषेत", "स्थानिकभाषेत", "तपशील"]]
-    name_mr = " ".join(filtered_mr) if filtered_mr else "-"
+    name_mr = " ".join(filtered_mr) if filtered_mr else ""
 
     # English tokens only
     en_tokens = re.findall(r"[A-Za-z]+", details_block)
     filtered_en = [w for w in en_tokens if w.lower() not in [
         "farmer", "details", "name", "as", "per", "aadhaar", "in", "english", "local", "language", "gender", "caste"
     ]]
-    name_en = " ".join(filtered_en) if filtered_en else "-"
+    name_en = " ".join(filtered_en) if filtered_en else ""
 
-    # Fallback to signature block on page 6 if English name was incomplete
-    if name_en == "-" or len(name_en.split()) < 2:
+    if not name_en or len(name_en.split()) < 2:
         sig_match = re.search(r"Farmer Name\s*\n\s*([A-Za-z\s]+)", full_text)
         if sig_match:
             name_en = " ".join(sig_match.group(1).split())
 
     # 4. DOB, Gender, Mobile
     dob_match = re.search(r"Date of Birth\s*[:]?\s*(\d{2}/\d{2}/\d{4})", full_text, re.IGNORECASE)
-    dob = dob_match.group(1).strip() if dob_match else "-"
+    dob = dob_match.group(1).strip() if dob_match else ""
 
     gender_match = re.search(r"Gender\s*[:]?\s*([A-Za-z]+)", full_text, re.IGNORECASE)
-    gender = gender_match.group(1).strip() if gender_match else "-"
+    gender = gender_match.group(1).strip() if gender_match else ""
 
     mobile_match = re.search(r"Mobile Number\s*[:]?\s*(\d{10})", full_text, re.IGNORECASE)
-    mobile = mobile_match.group(1).strip() if mobile_match else "-"
+    mobile = mobile_match.group(1).strip() if mobile_match else ""
 
     # 5. Addresses
-    address_en = "-"
+    address_en = ""
     addr_en_match = re.search(
         r"Address In English\s*([\s\S]*?)(?:Farmer type|Address In Local Language|Occupations)",
         full_text,
@@ -162,7 +163,7 @@ def parse_agristack_pdf(pdf_bytes):
         if clean_en:
             address_en = clean_en
 
-    address_mr = "-"
+    address_mr = ""
     addr_mr_match = re.search(
         r"Address In Local Language\s*([\s\S]*?)(?:Occupations|Farmer type|Land Ownership Details|Consent|$)",
         full_text,
@@ -174,11 +175,11 @@ def parse_agristack_pdf(pdf_bytes):
             address_mr = clean_mr
 
     # 6. Land Details Parsing
-    district_name = "-"
-    taluka_name = "-"
-    village_name = "-"
-    survey_no = "-"
-    area = "-"
+    district_name = ""
+    taluka_name = ""
+    village_name = ""
+    survey_no = ""
+    area = ""
 
     land_block_match = re.search(r"Land Ownership Details[\s\S]*?(?=Annexure|Consent|$)", full_text, re.IGNORECASE)
     land_text = land_block_match.group(0) if land_block_match else full_text
@@ -228,10 +229,6 @@ def parse_agristack_pdf(pdf_bytes):
     except Exception as e:
         st.warning(f"Photo extraction notice: {e}")
 
-    # 8. Local QR Generation
-    qr_payload = f"FarmerID:{farmer_id}|Name:{name_en}|DOB:{dob}"
-    qr_base64 = generate_local_qr_base64(qr_payload)
-
     return {
         "farmer_id": farmer_id,
         "name_en": name_en,
@@ -239,21 +236,22 @@ def parse_agristack_pdf(pdf_bytes):
         "dob": dob,
         "gender": gender,
         "mobile": mobile,
+        "aadhaar_no": "",
         "address_en": address_en,
         "address_mr": address_mr,
         "district": district_name,
         "taluka": taluka_name,
         "village": village_name,
         "survey_no": survey_no,
+        "khata_no": "-",
         "area": area,
-        "photo_base64": photo_base64,
-        "qr_base64": qr_base64
+        "photo_base64": photo_base64
     }
 
 # ----------------- 5. COMBINED CARD HTML -----------------
 
 def get_cards_page_html(data):
-    photo_tag = f'<img src="data:image/jpeg;base64,{data["photo_base64"]}" style="width:100%; height:100%; object-fit:cover; object-position:center center; display:block;" />' if data["photo_base64"] else '<div style="background:#eee;width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">No Photo</div>'
+    photo_tag = f'<img src="data:image/jpeg;base64,{data["photo_base64"]}" style="width:100%; height:100%; object-fit:cover; object-position:center center; display:block;" />' if data.get("photo_base64") else '<div style="background:#eee;width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">No Photo</div>'
     
     aadhaar_val = data.get("aadhaar_no", "").strip()
     if aadhaar_val:
@@ -265,11 +263,15 @@ def get_cards_page_html(data):
     else:
         aadhaar_display = "-"
 
-    raw_fid = data['farmer_id']
+    raw_fid = data.get("farmer_id", "-")
     if len(raw_fid) == 11:
         formatted_fid = f"{raw_fid[:4]} {raw_fid[4:8]} {raw_fid[8:]}"
     else:
         formatted_fid = raw_fid
+
+    # Generate QR Code dynamically from current confirmed inputs
+    qr_payload = f"FarmerID:{raw_fid}|Name:{data.get('name_en', '')}|DOB:{data.get('dob', '')}"
+    qr_base64 = generate_local_qr_base64(qr_payload)
 
     logo_src = get_local_logo_base64()
     if logo_src:
@@ -360,15 +362,15 @@ def get_cards_page_html(data):
                     {photo_tag}
                 </div>
                 <div class="details">
-                    <div><span class="field-label">नाव :</span> <span class="name-mr">{data['name_mr']}</span></div>
-                    <div class="name-en" style="padding-left: 38px;">{data['name_en']}</div>
-                    <div class="field-row"><span class="field-label">जन्म दिनांक / DOB :</span> {data['dob']}</div>
-                    <div class="field-row"><span class="field-label">लिंग / Gender :</span> {data['gender']}</div>
-                    <div class="field-row"><span class="field-label">मोबाइल / Mobile :</span> {data['mobile']}</div>
+                    <div><span class="field-label">नाव :</span> <span class="name-mr">{data.get('name_mr', '-')}</span></div>
+                    <div class="name-en" style="padding-left: 38px;">{data.get('name_en', '-')}</div>
+                    <div class="field-row"><span class="field-label">जन्म दिनांक / DOB :</span> {data.get('dob', '-')}</div>
+                    <div class="field-row"><span class="field-label">लिंग / Gender :</span> {data.get('gender', '-')}</div>
+                    <div class="field-row"><span class="field-label">मोबाइल / Mobile :</span> {data.get('mobile', '-')}</div>
                     <div class="field-row"><span class="field-label">आधार नं / Aadhaar No :</span> {aadhaar_display}</div>
                 </div>
                 <div class="qr-box">
-                    <img src="data:image/png;base64,{data['qr_base64']}" />
+                    <img src="data:image/png;base64,{qr_base64}" />
                 </div>
             </div>
             <div class="footer">
@@ -380,8 +382,8 @@ def get_cards_page_html(data):
         <div id="card-back" class="card card-back">
             <div class="sec-title">संपूर्ण पत्ता / Address</div>
             <div class="address-box">
-                <div class="address-mr">{data['address_mr']}</div>
-                <div class="address-en">{data['address_en']}</div>
+                <div class="address-mr">{data.get('address_mr', '-')}</div>
+                <div class="address-en">{data.get('address_en', '-')}</div>
             </div>
 
             <div class="sec-title">जमिनीची माहिती / Land Details</div>
@@ -398,12 +400,12 @@ def get_cards_page_html(data):
                 </thead>
                 <tbody>
                     <tr>
-                        <td>{data['district']}</td>
-                        <td>{data['taluka']}</td>
-                        <td>{data['village']}</td>
-                        <td>{data['survey_no']}</td>
-                        <td>-</td>
-                        <td>{data['area']}</td>
+                        <td>{data.get('district', '-')}</td>
+                        <td>{data.get('taluka', '-')}</td>
+                        <td>{data.get('village', '-')}</td>
+                        <td>{data.get('survey_no', '-')}</td>
+                        <td>{data.get('khata_no', '-')}</td>
+                        <td>{data.get('area', '-')}</td>
                     </tr>
                 </tbody>
             </table>
@@ -473,76 +475,129 @@ def login_page():
 def main_dashboard():
     col_title, col_logout = st.columns([5, 1])
     with col_title:
-        st.title("🌾 Agri Farmer ID Card Generator")
+        st.title("🌾 Agri Farmer ID Card Portal")
     with col_logout:
         if st.button("Sign Out"):
             st.session_state["authenticated"] = False
+            st.session_state["extracted_data"] = None
             st.session_state["card_front"] = None
             st.session_state["card_back"] = None
-            st.session_state["farmer_data"] = None
+            st.session_state["last_processed_file"] = None
             st.rerun()
 
-    st.write("Upload your registration PDF, enter the Aadhaar number, and press **Generate Card**.")
+    # STEP 1: UPLOAD PDF
+    st.markdown("### 📄 Step 1: Upload Farmer Registration PDF")
+    uploaded_file = st.file_uploader("Upload AgriStack Registration PDF", type=["pdf"])
 
-    with st.form("card_generation_form", clear_on_submit=False):
-        col_file, col_input = st.columns([2, 1])
+    if uploaded_file is not None:
+        file_bytes = uploaded_file.getvalue()
+        # Parse only when a new file is uploaded
+        if st.session_state["last_processed_file"] != uploaded_file.name:
+            with st.spinner("Extracting farmer data and photo from PDF..."):
+                parsed = parse_agristack_pdf(file_bytes)
+                st.session_state["extracted_data"] = parsed
+                st.session_state["last_processed_file"] = uploaded_file.name
+                st.session_state["card_front"] = None
+                st.session_state["card_back"] = None
+                st.success("Data extracted successfully! Review and edit fields below.")
 
-        with col_file:
-            uploaded_file = st.file_uploader("Upload Registration PDF", type=["pdf"])
+    # STEP 2: EDITABLE VERIFICATION FORM (FRONT & BACK SECTIONS)
+    if st.session_state["extracted_data"] is not None:
+        d = st.session_state["extracted_data"]
+        st.markdown("---")
+        st.markdown("### ✏️ Step 2: Verify & Edit Card Details")
+        st.caption("You can modify extracted fields or manually fill missing values before generating the card.")
 
-        with col_input:
-            user_aadhaar = st.text_input(
-                "Aadhaar Number",
-                placeholder="Enter 12-digit number",
-                max_chars=14
-            )
+        with st.form("card_edit_form"):
+            col_front_form, col_back_form = st.columns(2)
 
-        submitted = st.form_submit_button("Generate Card")
+            with col_front_form:
+                st.markdown("#### 🪪 Front Card Fields")
+                val_farmer_id = st.text_input("Farmer ID (11 Digits)", value=d.get("farmer_id", ""))
+                val_name_mr = st.text_input("नाव (Marathi Name)", value=d.get("name_mr", ""))
+                val_name_en = st.text_input("Name in English", value=d.get("name_en", ""))
+                val_dob = st.text_input("Date of Birth (DD/MM/YYYY)", value=d.get("dob", ""))
+                val_gender = st.text_input("Gender (Male / Female)", value=d.get("gender", ""))
+                val_mobile = st.text_input("Mobile Number", value=d.get("mobile", ""))
+                val_aadhaar = st.text_input("Aadhaar Number", value=d.get("aadhaar_no", ""), placeholder="Enter 12-digit number")
 
-    if submitted:
-        if uploaded_file is None:
-            st.error("Please upload the registration PDF first.")
-        else:
-            with st.spinner("Processing PDF and generating cards..."):
-                pdf_bytes = uploaded_file.getvalue()
-                farmer_data = parse_agristack_pdf(pdf_bytes)
-                farmer_data["aadhaar_no"] = user_aadhaar
+            with col_back_form:
+                st.markdown("#### 🏡 Back Card Fields")
+                val_addr_mr = st.text_area("संपूर्ण पत्ता (Marathi Address)", value=d.get("address_mr", ""), height=80)
+                val_addr_en = st.text_area("Address in English", value=d.get("address_en", ""), height=80)
+                
+                st.markdown("##### 🌾 जमिनीची माहिती (Land Details)")
+                col_l1, col_l2 = st.columns(2)
+                with col_l1:
+                    val_district = st.text_input("जिल्हा (District)", value=d.get("district", ""))
+                    val_taluka = st.text_input("तालुका (Taluka)", value=d.get("taluka", ""))
+                    val_village = st.text_input("गाव (Village)", value=d.get("village", ""))
+                with col_l2:
+                    val_survey = st.text_input("गट नं. / Survey No.", value=d.get("survey_no", ""))
+                    val_khata = st.text_input("खाते नं. / Khata No.", value=d.get("khata_no", "-"))
+                    val_area = st.text_input("क्षेत्र (Area in Hectare)", value=d.get("area", ""))
 
-                full_html = get_cards_page_html(farmer_data)
+            # Form submit button
+            btn_generate = st.form_submit_button("✨ Generate & Preview Card", use_container_width=True)
+
+        if btn_generate:
+            with st.spinner("Rendering ID cards..."):
+                final_data = {
+                    "farmer_id": val_farmer_id or "-",
+                    "name_mr": val_name_mr or "-",
+                    "name_en": val_name_en or "-",
+                    "dob": val_dob or "-",
+                    "gender": val_gender or "-",
+                    "mobile": val_mobile or "-",
+                    "aadhaar_no": val_aadhaar,
+                    "address_mr": val_addr_mr or "-",
+                    "address_en": val_addr_en or "-",
+                    "district": val_district or "-",
+                    "taluka": val_taluka or "-",
+                    "village": val_village or "-",
+                    "survey_no": val_survey or "-",
+                    "khata_no": val_khata or "-",
+                    "area": val_area or "-",
+                    "photo_base64": d.get("photo_base64", "")
+                }
+
+                # Update state so edits persist
+                st.session_state["extracted_data"] = final_data
+                full_html = get_cards_page_html(final_data)
                 front_png, back_png = render_cards_fast(full_html)
 
                 st.session_state["card_front"] = front_png
                 st.session_state["card_back"] = back_png
-                st.session_state["farmer_data"] = farmer_data
 
+    # STEP 3: PREVIEW & DOWNLOAD
     if st.session_state["card_front"] is not None and st.session_state["card_back"] is not None:
-        data = st.session_state["farmer_data"]
-        st.success(f"Card ready for: **{data['name_mr']}** ({data['name_en']})")
-
-        with st.expander("🔍 View Extracted Fields (Diagnostics)"):
-            st.json({k: v for k, v in data.items() if k not in ["photo_base64", "qr_base64"]})
+        st.markdown("---")
+        st.markdown("### 🖨️ Step 3: Preview & Download Card")
+        data = st.session_state["extracted_data"]
 
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("Front Side")
             st.image(st.session_state["card_front"], use_container_width=True)
             st.download_button(
-                label="Download Front",
+                label="📥 Download Front Card",
                 data=st.session_state["card_front"],
                 file_name=f"{data['farmer_id']}_front.png",
                 mime="image/png",
-                key="btn_download_front"
+                key="btn_download_front",
+                use_container_width=True
             )
 
         with col2:
             st.subheader("Back Side")
             st.image(st.session_state["card_back"], use_container_width=True)
             st.download_button(
-                label="Download Back",
+                label="📥 Download Back Card",
                 data=st.session_state["card_back"],
                 file_name=f"{data['farmer_id']}_back.png",
                 mime="image/png",
-                key="btn_download_back"
+                key="btn_download_back",
+                use_container_width=True
             )
 
 if not st.session_state["authenticated"]:
