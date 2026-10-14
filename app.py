@@ -2,6 +2,8 @@ import base64
 import io
 import os
 import re
+import shutil
+import subprocess
 import fitz  # PyMuPDF
 import qrcode
 from playwright.sync_api import sync_playwright
@@ -29,7 +31,20 @@ if "card_back" not in st.session_state:
 if "farmer_data" not in st.session_state:
     st.session_state["farmer_data"] = None
 
-# ----------------- 2. LOCAL ASSET ENGINES -----------------
+# ----------------- 2. PLAYWRIGHT CONTAINER SETUP -----------------
+
+@st.cache_resource
+def ensure_playwright_installed():
+    """Ensures Chromium binaries are installed on the cloud container once at startup."""
+    try:
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+    except Exception:
+        pass
+
+# Trigger installation on startup
+ensure_playwright_installed()
+
+# ----------------- 3. LOCAL ASSET ENGINES -----------------
 
 def get_local_logo_base64():
     """Reads the logo from the local directory and converts it to Base64."""
@@ -60,7 +75,7 @@ def generate_local_qr_base64(data_text):
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-# ----------------- 3. PDF EXTRACTION ENGINE -----------------
+# ----------------- 4. PDF EXTRACTION ENGINE -----------------
 
 def parse_agristack_pdf(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -173,7 +188,7 @@ def parse_agristack_pdf(pdf_bytes):
         "qr_base64": qr_base64
     }
 
-# ----------------- 4. COMBINED CARD HTML -----------------
+# ----------------- 5. COMBINED CARD HTML -----------------
 
 def get_cards_page_html(data):
     photo_tag = f'<img src="data:image/jpeg;base64,{data["photo_base64"]}" style="width:100%; height:100%; object-fit:cover; object-position:center center; display:block;" />' if data["photo_base64"] else '<div style="background:#eee;width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">No Photo</div>'
@@ -332,20 +347,36 @@ def get_cards_page_html(data):
     </html>
     """
 
-# ----------------- 5. ISOLATED RENDER ENGINE -----------------
+# ----------------- 6. ROBUST RENDER ENGINE -----------------
 
 def render_cards_fast(html_content):
+    ensure_playwright_installed()
+    
+    # Check if a system Chromium binary exists in Linux
+    system_chromium = shutil.which("chromium") or shutil.which("chromium-browser")
+
+    launch_kwargs = {
+        "headless": True,
+        "args": [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--single-process"
+        ]
+    }
+
+    if system_chromium:
+        launch_kwargs["executable_path"] = system_chromium
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--single-process"
-            ]
-        )
+        try:
+            browser = p.chromium.launch(**launch_kwargs)
+        except Exception:
+            # Fallback to standard launch if custom executable fails
+            launch_kwargs.pop("executable_path", None)
+            browser = p.chromium.launch(**launch_kwargs)
+
         page = browser.new_page(viewport={"width": 600, "height": 800}, device_scale_factor=2)
         page.set_content(html_content, wait_until="networkidle")
         page.evaluate("document.fonts.ready")
@@ -354,7 +385,7 @@ def render_cards_fast(html_content):
         browser.close()
         return front_bytes, back_bytes
 
-# ----------------- 6. UI ROUTING & STATE MANAGEMENT -----------------
+# ----------------- 7. UI ROUTING & STATE MANAGEMENT -----------------
 
 def login_page():
     st.markdown("<h2 style='text-align: center;'>🔐 Operator Login</h2>", unsafe_allow_html=True)
