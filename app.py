@@ -41,7 +41,6 @@ def ensure_playwright_installed():
     except Exception:
         pass
 
-# Trigger installation on startup
 ensure_playwright_installed()
 
 # ----------------- 3. LOCAL ASSET ENGINES -----------------
@@ -75,12 +74,13 @@ def generate_local_qr_base64(data_text):
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-# ----------------- 4. PDF EXTRACTION ENGINE -----------------
+# ----------------- 4. DYNAMIC PDF EXTRACTION ENGINE -----------------
 
 def parse_agristack_pdf(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page1 = doc[0]
 
+    # Extract clean text from all pages
     page_texts = [page.get_text("text") for page in doc]
     full_text = "\n".join(page_texts)
 
@@ -88,63 +88,78 @@ def parse_agristack_pdf(pdf_bytes):
         match = re.search(pattern, text, re.IGNORECASE)
         return match.group(group).strip() if match else ""
 
-    # Basic Details
-    farmer_id = clean_search(r"Farmer ID:\s*(\d+)", full_text) or "40307570637"
-    name_en = clean_search(r"Farmer Name as per Aadhaar in English\s*([^|\n]+)", full_text) or "Pramod Ashok Phatangare"
+    # 1. Farmer ID
+    farmer_id = clean_search(r"Farmer ID:\s*([0-9A-Za-z]+)", full_text)
+    if not farmer_id:
+        farmer_id = clean_search(r"Farmer Enrollment Number:\s*([0-9A-Za-z_-]+)", full_text)
 
-    name_mr_match = re.search(r"Farmer's Name in Local Language\s*([^|\n]+(?:\s*\|\s*[^|\n]+|\n[^\n|]+)?)", full_text)
+    # 2. Name in English
+    name_en = clean_search(r"Farmer Name as per Aadhaar in English\s*([^|\n]+)", full_text)
+    if not name_en:
+        name_en = clean_search(r"Farmer Name in English\s*([^|\n]+)", full_text)
+
+    # 3. Name in Local Language (Marathi / Hindi)
     name_mr = ""
+    name_mr_match = re.search(r"Farmer's Name in Local Language\s*([^|\n]+(?:\s*\|\s*[^|\n]+|\n[^\n|]+)?)", full_text)
     if name_mr_match:
         name_mr = " ".join(name_mr_match.group(1).replace("|", " ").split())
     else:
-        name_mr = "प्रमोद अशोक फटांगरे"
+        name_mr = clean_search(r"Farmer Name in Local Language\s*([^|\n]+)", full_text)
 
-    dob = clean_search(r"Date of Birth\s*(\d{2}/\d{2}/\d{4})", full_text) or "28/09/1992"
-    gender = clean_search(r"Gender\s*([A-Za-z]+)", full_text) or "Male"
-    mobile = clean_search(r"Mobile Number\s*(\d{10})", full_text) or "9730306032"
+    # 4. Demographic Details
+    dob = clean_search(r"Date of Birth\s*(\d{2}/\d{2}/\d{4})", full_text)
+    gender = clean_search(r"Gender\s*([A-Za-z]+)", full_text)
+    mobile = clean_search(r"Mobile Number\s*(\d{10})", full_text)
 
-    # Addresses
+    # 5. Addresses (English & Local Language)
+    address_en = ""
     addr_en_match = re.search(r"Address In English\s*(.*?)\s*Address In Local Language", full_text, re.DOTALL)
     if addr_en_match:
         address_en = " ".join(addr_en_match.group(1).replace("\n", " ").split())
     else:
-        address_en = clean_search(r"Address In English\s*([^|\n]+)", full_text) or "S NO.26/6B, FLAT NO.401 SWAMI SAMARATH APARTMENT ,GANESH NAGAR ,PIMPALE GURAV, HAVELI"
+        address_en = clean_search(r"Address In English\s*([^|\n]+)", full_text)
 
-    addr_mr_match = re.search(r"Address In Local Language\s*(.*?)\s*(?:Farmer type|Occupations|Land Ownership Details)", full_text, re.DOTALL)
+    address_mr = ""
+    addr_mr_match = re.search(r"Address In Local Language\s*(.*?)\s*(?:Farmer type|Occupations|Land Ownership Details|$)", full_text, re.DOTALL)
     if addr_mr_match:
         address_mr = " ".join(addr_mr_match.group(1).replace("\n", " ").split())
     else:
-        address_mr = clean_search(r"Address In Local Language\s*([^|\n]+)", full_text) or "एस. नं. 26/6 बी, फ्लैट नं. 401 स्वामी समर्थ विभाग, गणेश नगर, पिम्पले गौरव, हावेली"
+        address_mr = clean_search(r"Address In Local Language\s*([^|\n]+)", full_text)
 
-    # Land Details
-    district_mr = "अहिल्यानगर"
-    taluka_mr = "संगमनेर"
-    village_mr = "अकलापूर"
-    survey_no = "17"
-    area = "0.46"
+    # 6. Land Details Parsing (Dynamic extraction from table)
+    district_name = ""
+    taluka_name = ""
+    village_name = ""
+    survey_no = ""
+    area = ""
 
+    # Match Land record row pattern: State | District | Taluka | Village | Survey/Gat | Sub-division | Area
     land_match = re.search(
-        r"MAHARA[\s\n]*SHTRA\s*\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*(\d+)\s*\|.*?\|\s*([\d\.]+)",
+        r"(?:MAHARASHTRA|STATE)\s*\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*([0-9/A-Za-z_-]+)\s*\|.*?\|\s*([0-9\.]+)",
         full_text,
-        re.DOTALL
+        re.DOTALL | re.IGNORECASE
     )
 
     if land_match:
-        dist_raw = "".join(land_match.group(1).split()).upper()
-        tal_raw = "".join(land_match.group(2).split()).upper()
-        vill_raw = "".join(land_match.group(3).split()).upper()
+        district_name = land_match.group(1).strip()
+        taluka_name = land_match.group(2).strip()
+        village_name = land_match.group(3).strip()
         survey_no = land_match.group(4).strip()
         raw_area = land_match.group(5).strip().rstrip(",")
         try:
             area = f"{float(raw_area):.2f}"
         except ValueError:
             area = raw_area
+    else:
+        # Fallback to general land details search if pipe-separated format differs
+        survey_match = re.search(r"(?:Survey/Gat Number|Survey No|Gat No)\s*[:|-]?\s*([0-9/A-Za-z_-]+)", full_text, re.IGNORECASE)
+        if survey_match:
+            survey_no = survey_match.group(1).strip()
+        area_match = re.search(r"(?:Area in Hectare|Total Area|Area)\s*[:|-]?\s*([0-9\.]+)", full_text, re.IGNORECASE)
+        if area_match:
+            area = area_match.group(1).strip()
 
-        if "AHILYA" in dist_raw: district_mr = "अहिल्यानगर"
-        if "SANGAM" in tal_raw: taluka_mr = "संगमनेर"
-        if "AKALAP" in vill_raw: village_mr = "अकलापूर"
-
-    # Centered Photo Extraction
+    # 7. Centered Photo Extraction
     photo_base64 = ""
     try:
         search_hits = page1.search_for("Farmer Photograph")
@@ -165,25 +180,26 @@ def parse_agristack_pdf(pdf_bytes):
             pix = page1.get_pixmap(clip=clip_rect, dpi=300)
             photo_base64 = base64.b64encode(pix.tobytes("jpeg")).decode("utf-8")
     except Exception as e:
-        st.warning(f"Photo extraction error: {e}")
+        st.warning(f"Photo extraction notice: {e}")
 
-    qr_payload = f"FarmerID:{farmer_id}|Name:{name_en}"
+    # 8. Local QR Generation with dynamic parsed values
+    qr_payload = f"FarmerID:{farmer_id}|Name:{name_en}|DOB:{dob}"
     qr_base64 = generate_local_qr_base64(qr_payload)
 
     return {
-        "farmer_id": farmer_id,
-        "name_en": name_en,
-        "name_mr": name_mr,
-        "dob": dob,
-        "gender": gender,
-        "mobile": mobile,
-        "address_en": address_en,
-        "address_mr": address_mr,
-        "district": district_mr,
-        "taluka": taluka_mr,
-        "village": village_mr,
-        "survey_no": survey_no,
-        "area": area,
+        "farmer_id": farmer_id or "-",
+        "name_en": name_en or "-",
+        "name_mr": name_mr or "-",
+        "dob": dob or "-",
+        "gender": gender or "-",
+        "mobile": mobile or "-",
+        "address_en": address_en or "-",
+        "address_mr": address_mr or "-",
+        "district": district_name or "-",
+        "taluka": taluka_name or "-",
+        "village": village_name or "-",
+        "survey_no": survey_no or "-",
+        "area": area or "-",
         "photo_base64": photo_base64,
         "qr_base64": qr_base64
     }
@@ -201,7 +217,7 @@ def get_cards_page_html(data):
         else:
             aadhaar_display = aadhaar_val
     else:
-        aadhaar_display = "[Aadhaar Redacted]"
+        aadhaar_display = "-"
 
     raw_fid = data['farmer_id']
     if len(raw_fid) == 11:
@@ -352,7 +368,6 @@ def get_cards_page_html(data):
 def render_cards_fast(html_content):
     ensure_playwright_installed()
     
-    # Check if a system Chromium binary exists in Linux
     system_chromium = shutil.which("chromium") or shutil.which("chromium-browser")
 
     launch_kwargs = {
@@ -373,7 +388,6 @@ def render_cards_fast(html_content):
         try:
             browser = p.chromium.launch(**launch_kwargs)
         except Exception:
-            # Fallback to standard launch if custom executable fails
             launch_kwargs.pop("executable_path", None)
             browser = p.chromium.launch(**launch_kwargs)
 
@@ -437,7 +451,7 @@ def main_dashboard():
         if uploaded_file is None:
             st.error("Please upload the registration PDF first.")
         else:
-            with st.spinner("Generating cards..."):
+            with st.spinner("Extracting details and generating cards..."):
                 pdf_bytes = uploaded_file.read()
                 farmer_data = parse_agristack_pdf(pdf_bytes)
                 farmer_data["aadhaar_no"] = user_aadhaar
