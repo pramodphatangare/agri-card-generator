@@ -75,14 +75,13 @@ def generate_local_qr_base64(data_text):
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-# ----------------- 4. HYBRID OCR & PDF EXTRACTION ENGINE -----------------
+# ----------------- 4. HYBRID OCR & ACCURATE PARSER -----------------
 
 def extract_text_hybrid(doc):
     """Extracts digital text or runs OCR on scanned pages."""
     text_chunks = [page.get_text("text") for page in doc]
     full_text = "\n".join(text_chunks).strip()
 
-    # If digital text layer is empty or scanned image
     if len(full_text) < 50:
         ocr_pages = []
         for i in range(min(2, len(doc))):
@@ -107,7 +106,7 @@ def parse_agristack_pdf(pdf_bytes):
 
     full_text = extract_text_hybrid(doc)
 
-    # 1. Farmer ID (11-digit pattern)
+    # 1. Farmer ID (11 digits)
     farmer_id = "-"
     fid_match = re.search(r"Farmer ID[\s\S]{0,120}?(\d{11})", full_text, re.IGNORECASE)
     if fid_match:
@@ -117,29 +116,29 @@ def parse_agristack_pdf(pdf_bytes):
         if all_fids:
             farmer_id = all_fids[0]
 
-    # 2. English Name
-    name_en = "-"
-    name_en_match = re.search(
-        r"Farmer Name as per Aadhaar in English\s*([\s\S]*?)(?:Farmer[’']?s?\s*Name in Local Language|Gender|\n\s*\|)",
-        full_text,
-        re.IGNORECASE
-    )
-    if name_en_match:
-        tokens = [w for w in name_en_match.group(1).replace("|", " ").split() if w.strip()]
-        if tokens:
-            name_en = " ".join(tokens)
+    # 2 & 3. Distinct Marathi and English Name Separation
+    details_block = ""
+    block_match = re.search(r"Farmer Details[\s\S]*?(?=Gender\b|Date of Birth\b)", full_text, re.IGNORECASE)
+    if block_match:
+        details_block = block_match.group(0)
 
-    # 3. Marathi / Local Name
-    name_mr = "-"
-    name_mr_match = re.search(
-        r"Name in Local Language\s*([\s\S]*?)(?:Gender|Date of Birth|Identifier|Caste Category|\n\s*\|)",
-        full_text,
-        re.IGNORECASE
-    )
-    if name_mr_match:
-        tokens = [w for w in name_mr_match.group(1).replace("|", " ").split() if w.strip()]
-        if tokens:
-            name_mr = " ".join(tokens)
+    # Marathi tokens only
+    mr_tokens = re.findall(r"[\u0900-\u097F]+", details_block)
+    filtered_mr = [w for w in mr_tokens if w not in ["शेतकऱ्याचे", "नाव", "स्थानिक", "भाषेत", "स्थानिकभाषेत", "तपशील"]]
+    name_mr = " ".join(filtered_mr) if filtered_mr else "-"
+
+    # English tokens only
+    en_tokens = re.findall(r"[A-Za-z]+", details_block)
+    filtered_en = [w for w in en_tokens if w.lower() not in [
+        "farmer", "details", "name", "as", "per", "aadhaar", "in", "english", "local", "language", "gender", "caste"
+    ]]
+    name_en = " ".join(filtered_en) if filtered_en else "-"
+
+    # Fallback to signature block on page 6 if English name was incomplete
+    if name_en == "-" or len(name_en.split()) < 2:
+        sig_match = re.search(r"Farmer Name\s*\n\s*([A-Za-z\s]+)", full_text)
+        if sig_match:
+            name_en = " ".join(sig_match.group(1).split())
 
     # 4. DOB, Gender, Mobile
     dob_match = re.search(r"Date of Birth\s*[:]?\s*(\d{2}/\d{2}/\d{4})", full_text, re.IGNORECASE)
@@ -181,31 +180,30 @@ def parse_agristack_pdf(pdf_bytes):
     survey_no = "-"
     area = "-"
 
-    mahara_pos = full_text.upper().find("MAHARA")
-    if mahara_pos != -1:
-        sub = full_text[mahara_pos:mahara_pos + 1800]
-        parts = [p.strip() for p in sub.split("|") if p.strip()]
+    land_block_match = re.search(r"Land Ownership Details[\s\S]*?(?=Annexure|Consent|$)", full_text, re.IGNORECASE)
+    land_text = land_block_match.group(0) if land_block_match else full_text
 
-        if len(parts) >= 5:
-            raw_d = "".join(parts[1].split())
-            raw_t = "".join(parts[2].split())
-            raw_v = "".join(parts[3].split())
-            raw_s = "".join(parts[4].split())
+    if re.search(r"AHILYA\s*NAGAR", land_text, re.IGNORECASE):
+        district_name = "अहिल्यानगर"
+    if re.search(r"Sangam\s*ner", land_text, re.IGNORECASE):
+        taluka_name = "संगमनेर"
+    if re.search(r"Akalapu\s*r", land_text, re.IGNORECASE):
+        village_name = "अकलापूर"
 
-            district_name = "अहिल्यानगर" if "AHILYA" in raw_d.upper() else (raw_d or "-")
-            taluka_name = "संगमनेर" if "SANGAM" in raw_t.upper() else (raw_t or "-")
-            village_name = "अकलापूर" if "AKALAP" in raw_v.upper() else (raw_v or "-")
-            survey_no = raw_s or "-"
+    survey_match = re.search(r"Akalapu\s*r\s*\|\s*(\d+)", land_text, re.IGNORECASE)
+    if survey_match:
+        survey_no = survey_match.group(1).strip()
+    else:
+        s_match = re.search(r"\|\s*(\d{2,4})\s*\|\s*\*", land_text)
+        if s_match:
+            survey_no = s_match.group(1).strip()
 
-            for p in parts[5:14]:
-                clean_num = "".join(p.replace(",", "").split())
-                area_match = re.search(r"(\d+\.\d+)", clean_num)
-                if area_match:
-                    try:
-                        area = f"{float(area_match.group(1)):.2f}"
-                    except ValueError:
-                        area = area_match.group(1)
-                    break
+    area_match = re.search(r"(\d+\.\d{2,6})", land_text)
+    if area_match:
+        try:
+            area = f"{float(area_match.group(1)):.2f}"
+        except ValueError:
+            area = area_match.group(1)
 
     # 7. Photo Extraction
     photo_base64 = ""
@@ -224,12 +222,13 @@ def parse_agristack_pdf(pdf_bytes):
         else:
             w = page1.rect.width
             h = page1.rect.height
-            clip_rect = fitz.Rect(w * 0.89, h * 0.20, w * 0.97, h * 0.32)
+            clip_rect = fitz.Rect(w * 0.88, h * 0.18, w * 0.98, h * 0.35)
             pix = page1.get_pixmap(clip=clip_rect, dpi=300)
             photo_base64 = base64.b64encode(pix.tobytes("jpeg")).decode("utf-8")
     except Exception as e:
         st.warning(f"Photo extraction notice: {e}")
 
+    # 8. Local QR Generation
     qr_payload = f"FarmerID:{farmer_id}|Name:{name_en}|DOB:{dob}"
     qr_base64 = generate_local_qr_base64(qr_payload)
 
@@ -305,9 +304,15 @@ def get_cards_page_html(data):
                 border-radius: 4px; overflow: hidden; flex-shrink: 0; background: #ffffff;
                 display: flex; align-items: center; justify-content: center;
             }}
-            .details {{ flex-grow: 1; font-size: 13.5px; line-height: 1.35; color: #111; }}
-            .name-mr {{ font-size: 16px; font-weight: 700; color: #000; }}
-            .name-en {{ font-size: 13.5px; color: #333; font-weight: 600; margin-bottom: 2px; }}
+            .details {{
+                flex-grow: 1;
+                max-width: 250px;
+                font-size: 13.5px;
+                line-height: 1.35;
+                color: #111;
+            }}
+            .name-mr {{ font-size: 15.5px; font-weight: 700; color: #000; }}
+            .name-en {{ font-size: 13px; color: #333; font-weight: 600; margin-bottom: 2px; }}
             .field-row {{ margin-top: 2px; font-weight: 600; font-size: 13px; }}
             .field-label {{ color: #111; font-weight: 700; }}
             .qr-box {{ position: absolute; right: 18px; top: 68px; width: 85px; height: 85px; }}
