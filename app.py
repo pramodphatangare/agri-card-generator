@@ -74,123 +74,133 @@ def generate_local_qr_base64(data_text):
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-# ----------------- 4. DYNAMIC PDF EXTRACTION ENGINE -----------------
+# ----------------- 4. RESILIENT DYNAMIC PARSER -----------------
 
 def parse_agristack_pdf(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page1 = doc[0]
 
-    # Combine text from all pages
+    # Extract text from all pages
     page_texts = [page.get_text("text") for page in doc]
     full_text = "\n".join(page_texts)
 
-    # 1. Farmer ID (handles multi-line shift)
-    farmer_id = ""
-    fid_match = re.search(r"Farmer ID:\s*(?:Farmer Registration Form\s*)?(\d{11})", full_text)
+    # 1. Farmer ID (11 digits, resilient to line breaks between label and value)
+    farmer_id = "-"
+    fid_match = re.search(r"Farmer ID[\s\S]{0,120}?(\d{11})", full_text, re.IGNORECASE)
     if fid_match:
         farmer_id = fid_match.group(1).strip()
     else:
-        # Fallback search for any 11-digit number near the header
-        generic_fid = re.search(r"\b(\d{11})\b", full_text[:500])
-        if generic_fid:
-            farmer_id = generic_fid.group(1).strip()
+        all_fids = re.findall(r"\b(\d{11})\b", full_text)
+        if all_fids:
+            farmer_id = all_fids[0]
 
-    # 2. English Name (captures multi-line until the next label)
-    name_en = ""
+    # 2. English Name (captures multi-line wraps like 'Barakubai\nParbhati Sable')
+    name_en = "-"
     name_en_match = re.search(
-        r"Farmer Name as per Aadhaar in English\s*(.*?)(?=\||Farmer's Name|Gender)",
+        r"Farmer Name as per Aadhaar in English\s*([\s\S]*?)(?:Farmer[’']?s?\s*Name in Local Language|Gender|\n\s*\|)",
         full_text,
-        re.DOTALL
+        re.IGNORECASE
     )
     if name_en_match:
-        name_en = " ".join(name_en_match.group(1).replace("|", " ").split())
+        tokens = [w for w in name_en_match.group(1).replace("|", " ").split() if w.strip()]
+        if tokens:
+            name_en = " ".join(tokens)
 
     # 3. Marathi / Local Language Name
-    name_mr = ""
+    name_mr = "-"
     name_mr_match = re.search(
-        r"Farmer's Name in Local Language\s*(.*?)(?=Gender|Date of Birth|Identifier|Caste)",
+        r"Name in Local Language\s*([\s\S]*?)(?:Gender|Date of Birth|Identifier|Caste Category|\n\s*\|)",
         full_text,
-        re.DOTALL
+        re.IGNORECASE
     )
     if name_mr_match:
-        name_mr = " ".join(name_mr_match.group(1).replace("|", " ").split())
+        tokens = [w for w in name_mr_match.group(1).replace("|", " ").split() if w.strip()]
+        if tokens:
+            name_mr = " ".join(tokens)
 
     # 4. DOB, Gender, Mobile
-    dob_match = re.search(r"Date of Birth\s*(\d{2}/\d{2}/\d{4})", full_text)
+    dob_match = re.search(r"Date of Birth\s*[:]?\s*(\d{2}/\d{2}/\d{4})", full_text, re.IGNORECASE)
     dob = dob_match.group(1).strip() if dob_match else "-"
 
-    gender_match = re.search(r"Gender\s*([A-Za-z]+)", full_text)
+    gender_match = re.search(r"Gender\s*[:]?\s*([A-Za-z]+)", full_text, re.IGNORECASE)
     gender = gender_match.group(1).strip() if gender_match else "-"
 
-    mobile_match = re.search(r"Mobile Number\s*(\d{10})", full_text)
+    mobile_match = re.search(r"Mobile Number\s*[:]?\s*(\d{10})", full_text, re.IGNORECASE)
     mobile = mobile_match.group(1).strip() if mobile_match else "-"
 
     # 5. Addresses (English & Marathi)
     address_en = "-"
     addr_en_match = re.search(
-        r"Address In English\s*(.*?)(?=Address In Local Language|Farmer type|Occupations)",
+        r"Address In English\s*([\s\S]*?)(?:Farmer type|Address In Local Language|Occupations)",
         full_text,
-        re.DOTALL
+        re.IGNORECASE
     )
     if addr_en_match:
-        clean_addr_en = " ".join(addr_en_match.group(1).replace("|", " ").replace("\n", " ").split())
-        if clean_addr_en:
-            address_en = clean_addr_en
+        clean_en = " ".join(addr_en_match.group(1).replace("|", " ").split())
+        if clean_en:
+            address_en = clean_en
 
     address_mr = "-"
     addr_mr_match = re.search(
-        r"Address In Local Language\s*(.*?)(?=Farmer type|Occupations|Land Ownership Details|$)",
+        r"Address In Local Language\s*([\s\S]*?)(?:Occupations|Farmer type|Land Ownership Details|Consent|$)",
         full_text,
-        re.DOTALL
+        re.IGNORECASE
     )
     if addr_mr_match:
-        clean_addr_mr = " ".join(addr_mr_match.group(1).replace("|", " ").replace("\n", " ").split())
-        if clean_addr_mr:
-            address_mr = clean_addr_mr
+        clean_mr = " ".join(addr_mr_match.group(1).replace("|", " ").split())
+        if clean_mr:
+            address_mr = clean_mr
 
-    # 6. Land Details Parsing (Cleanly handles hyphenated word wraps like Sangam\nner, Akalapu\nr)
+    # 6. Land Details Parsing (Table pipe tokenization)
     district_name = "-"
     taluka_name = "-"
     village_name = "-"
     survey_no = "-"
     area = "-"
 
-    # Search for first entry in the Land Ownership Table
-    land_match = re.search(
-        r"MAHARA[\s\n]*SHTRA\s*\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*([0-9/A-Za-z_-]+)\s*\|.*?\|\s*([0-9\.]+)",
-        full_text,
-        re.DOTALL | re.IGNORECASE
-    )
+    mahara_pos = full_text.upper().find("MAHARA")
+    if mahara_pos != -1:
+        sub = full_text[mahara_pos:mahara_pos + 1800]
+        parts = [p.strip() for p in sub.split("|") if p.strip()]
 
-    if land_match:
-        raw_dist = "".join(land_match.group(1).split())
-        raw_tal = "".join(land_match.group(2).split())
-        raw_vill = "".join(land_match.group(3).split())
+        if len(parts) >= 5:
+            raw_d = "".join(parts[1].split())
+            raw_t = "".join(parts[2].split())
+            raw_v = "".join(parts[3].split())
+            raw_s = "".join(parts[4].split())
 
-        # Map to proper Marathi script
-        if "AHILYA" in raw_dist.upper():
-            district_name = "अहिल्यानगर"
-        else:
-            district_name = raw_dist
+            # District mapping
+            if "AHILYA" in raw_d.upper():
+                district_name = "अहिल्यानगर"
+            else:
+                district_name = raw_d or "-"
 
-        if "SANGAM" in raw_tal.upper():
-            taluka_name = "संगमनेर"
-        else:
-            taluka_name = raw_tal
+            # Taluka mapping
+            if "SANGAM" in raw_t.upper():
+                taluka_name = "संगमनेर"
+            else:
+                taluka_name = raw_t or "-"
 
-        if "AKALAP" in raw_vill.upper():
-            village_name = "अकलापूर"
-        else:
-            village_name = raw_vill
+            # Village mapping
+            if "AKALAP" in raw_v.upper():
+                village_name = "अकलापूर"
+            else:
+                village_name = raw_v or "-"
 
-        survey_no = land_match.group(4).strip()
-        raw_area = land_match.group(5).strip().rstrip(",")
-        try:
-            area = f"{float(raw_area):.2f}"
-        except ValueError:
-            area = raw_area
+            survey_no = raw_s or "-"
 
-    # 7. Centered Photo Extraction
+            # Find area float among the remaining cells
+            for p in parts[5:14]:
+                clean_num = "".join(p.replace(",", "").split())
+                area_match = re.search(r"(\d+\.\d+)", clean_num)
+                if area_match:
+                    try:
+                        area = f"{float(area_match.group(1)):.2f}"
+                    except ValueError:
+                        area = area_match.group(1)
+                    break
+
+    # 7. Photo Extraction
     photo_base64 = ""
     try:
         search_hits = page1.search_for("Farmer Photograph")
@@ -218,9 +228,9 @@ def parse_agristack_pdf(pdf_bytes):
     qr_base64 = generate_local_qr_base64(qr_payload)
 
     return {
-        "farmer_id": farmer_id or "-",
-        "name_en": name_en or "-",
-        "name_mr": name_mr or "-",
+        "farmer_id": farmer_id,
+        "name_en": name_en,
+        "name_mr": name_mr,
         "dob": dob,
         "gender": gender,
         "mobile": mobile,
@@ -483,7 +493,8 @@ def main_dashboard():
             st.error("Please upload the registration PDF first.")
         else:
             with st.spinner("Extracting details and generating cards..."):
-                pdf_bytes = uploaded_file.read()
+                # Use getvalue() so the file buffer is read reliably every time
+                pdf_bytes = uploaded_file.getvalue()
                 farmer_data = parse_agristack_pdf(pdf_bytes)
                 farmer_data["aadhaar_no"] = user_aadhaar
 
@@ -497,6 +508,9 @@ def main_dashboard():
     if st.session_state["card_front"] is not None and st.session_state["card_back"] is not None:
         data = st.session_state["farmer_data"]
         st.success(f"Card ready for: **{data['name_mr']}** ({data['name_en']})")
+
+        with st.expander("🔍 View Extracted Fields (Diagnostics)"):
+            st.json({k: v for k, v in data.items() if k not in ["photo_base64", "qr_base64"]})
 
         col1, col2 = st.columns(2)
         with col1:
