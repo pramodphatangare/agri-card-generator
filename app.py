@@ -8,6 +8,7 @@ import fitz  # PyMuPDF
 import pandas as pd
 from PIL import Image
 import pytesseract
+from pytesseract import Output
 import qrcode
 from playwright.sync_api import sync_playwright
 import streamlit as st
@@ -79,7 +80,77 @@ def generate_local_qr_base64(data_text):
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-# ----------------- 4. HYBRID OCR & ACCURATE PARSER -----------------
+# ----------------- 4. OCR PHOTO DETECTOR ENGINE -----------------
+
+def detect_and_crop_photo_ocr(page):
+    """
+    Renders the page to a 300 DPI image and uses OCR word coordinates
+    to detect 'Photograph' or 'Farmer' in the top-right header, then crops the
+    portrait box immediately below it without any header text overlap.
+    """
+    try:
+        pix = page.get_pixmap(dpi=300)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        img_w, img_h = img.size
+
+        # Use OCR to get positional bounding boxes of all words
+        ocr_data = pytesseract.image_to_data(img, output_type=Output.DICT, lang="eng")
+        
+        target_x, target_y, target_w, target_h = None, None, None, None
+        n_boxes = len(ocr_data['text'])
+
+        for i in range(n_boxes):
+            text = ocr_data['text'][i].strip().lower()
+            x = ocr_data['left'][i]
+            y = ocr_data['top'][i]
+            w = ocr_data['width'][i]
+            h = ocr_data['height'][i]
+
+            # We are looking for "photograph" or "photo" in the top-right quadrant
+            if ("photo" in text or "graph" in text) and x > (img_w * 0.65) and y < (img_h * 0.40):
+                target_x, target_y, target_w, target_h = x, y, w, h
+                break
+
+        # Fallback check for the word "farmer" in the top-right if "photograph" was missed
+        if target_x is None:
+            for i in range(n_boxes):
+                text = ocr_data['text'][i].strip().lower()
+                x = ocr_data['left'][i]
+                y = ocr_data['top'][i]
+                w = ocr_data['width'][i]
+                h = ocr_data['height'][i]
+                if text == "farmer" and x > (img_w * 0.70) and y < (img_h * 0.35):
+                    target_x, target_y, target_w, target_h = x, y, w, h
+                    break
+
+        # If detected via OCR coordinates
+        if target_x is not None:
+            # Crop box positioned directly below the detected text
+            # Add a small buffer to avoid cutting the top border
+            crop_top = target_y + target_h + int(img_h * 0.012)
+            # Standard passport height in this layout is ~13-14% of page height
+            crop_bottom = crop_top + int(img_h * 0.135)
+            # Center the crop width relative to the label
+            center_x = target_x + (target_w // 2)
+            half_box_w = int(img_w * 0.048)
+            crop_left = max(0, center_x - half_box_w)
+            crop_right = min(img_w, center_x + half_box_w)
+
+            cropped = img.crop((crop_left, crop_top, crop_right, crop_bottom))
+            buf = io.BytesIO()
+            cropped.save(buf, format="JPEG")
+            return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        # Proportional fallback if OCR box was not found
+        clip_rect = fitz.Rect(page.rect.width * 0.880, page.rect.height * 0.205, page.rect.width * 0.980, page.rect.height * 0.380)
+        fallback_pix = page.get_pixmap(clip=clip_rect, dpi=300)
+        return base64.b64encode(fallback_pix.tobytes("jpeg")).decode("utf-8")
+
+    except Exception as e:
+        st.warning(f"Photo detection note: {e}")
+        return ""
+
+# ----------------- 5. HYBRID OCR & ACCURATE PARSER -----------------
 
 def extract_text_hybrid(doc):
     text_chunks = [page.get_text("text") for page in doc]
@@ -225,18 +296,8 @@ def parse_agristack_pdf(pdf_bytes):
             "area": ""
         })
 
-    # 7. Exact Full-Head Photo Extraction
-    photo_base64 = ""
-    try:
-        w = page1.rect.width
-        h = page1.rect.height
-        
-        # 0.205 to 0.380 captures full head, hair, and collar without header text
-        clip_rect = fitz.Rect(w * 0.880, h * 0.205, w * 0.980, h * 0.380)
-        pix = page1.get_pixmap(clip=clip_rect, dpi=300)
-        photo_base64 = base64.b64encode(pix.tobytes("jpeg")).decode("utf-8")
-    except Exception as e:
-        st.warning(f"Photo extraction notice: {e}")
+    # 7. Automated OCR Photo Finder
+    photo_base64 = detect_and_crop_photo_ocr(page1)
 
     return {
         "farmer_id": farmer_id,
@@ -252,7 +313,7 @@ def parse_agristack_pdf(pdf_bytes):
         "photo_base64": photo_base64
     }
 
-# ----------------- 5. COMBINED CARD HTML -----------------
+# ----------------- 6. COMBINED CARD HTML -----------------
 
 def get_cards_page_html(data):
     photo_tag = f'<img src="data:image/jpeg;base64,{data["photo_base64"]}" style="width:100%; height:100%; object-fit:cover; object-position:center center; display:block;" />' if data.get("photo_base64") else '<div style="background:#eee;width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">No Photo</div>'
@@ -431,7 +492,7 @@ def get_cards_page_html(data):
     </html>
     """
 
-# ----------------- 6. ROBUST RENDER ENGINE -----------------
+# ----------------- 7. ROBUST RENDER ENGINE -----------------
 
 def render_cards_fast(html_content):
     ensure_environment_ready()
@@ -467,7 +528,7 @@ def render_cards_fast(html_content):
         browser.close()
         return front_bytes, back_bytes
 
-# ----------------- 7. UI ROUTING & STATE MANAGEMENT -----------------
+# ----------------- 8. UI ROUTING & STATE MANAGEMENT -----------------
 
 def login_page():
     st.markdown("<h2 style='text-align: center;'>🔐 Operator Login</h2>", unsafe_allow_html=True)
@@ -506,13 +567,13 @@ def main_dashboard():
     if uploaded_file is not None:
         file_bytes = uploaded_file.getvalue()
         if st.session_state["last_processed_file"] != uploaded_file.name:
-            with st.spinner("Extracting farmer data, land parcels, and photo..."):
+            with st.spinner("Locating farmer photo with OCR and extracting land parcels..."):
                 parsed = parse_agristack_pdf(file_bytes)
                 st.session_state["extracted_data"] = parsed
                 st.session_state["last_processed_file"] = uploaded_file.name
                 st.session_state["card_front"] = None
                 st.session_state["card_back"] = None
-                st.success("Data extracted successfully! Review and edit details below.")
+                st.success("Data and photo captured successfully! Review and edit details below.")
 
     # STEP 2: EDITABLE VERIFICATION FORM
     if st.session_state["extracted_data"] is not None:
