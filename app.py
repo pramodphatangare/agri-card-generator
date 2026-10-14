@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import fitz  # PyMuPDF
+import pandas as pd
 from PIL import Image
 import pytesseract
 import qrcode
@@ -40,7 +41,7 @@ if "last_processed_file" not in st.session_state:
 
 @st.cache_resource
 def ensure_environment_ready():
-    """Installs Chromium binaries on the cloud container if missing."""
+    """Installs Chromium binaries on the container if missing."""
     try:
         subprocess.run(["playwright", "install", "chromium"], check=True)
     except Exception:
@@ -78,7 +79,7 @@ def generate_local_qr_base64(data_text):
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-# ----------------- 4. HYBRID OCR & ACCURATE PARSER -----------------
+# ----------------- 4. HYBRID OCR & MULTI-RECORD PARSER -----------------
 
 def extract_text_hybrid(doc):
     text_chunks = [page.get_text("text") for page in doc]
@@ -174,37 +175,59 @@ def parse_agristack_pdf(pdf_bytes):
         if clean_mr:
             address_mr = clean_mr
 
-    # 6. Land Details Parsing
-    district_name = ""
-    taluka_name = ""
-    village_name = ""
-    survey_no = ""
-    area = ""
-
+    # 6. Multi-Record Land Details Parsing
+    land_records = []
     land_block_match = re.search(r"Land Ownership Details[\s\S]*?(?=Annexure|Consent|$)", full_text, re.IGNORECASE)
     land_text = land_block_match.group(0) if land_block_match else full_text
 
-    if re.search(r"AHILYA\s*NAGAR", land_text, re.IGNORECASE):
-        district_name = "अहिल्यानगर"
-    if re.search(r"Sangam\s*ner", land_text, re.IGNORECASE):
-        taluka_name = "संगमनेर"
-    if re.search(r"Akalapu\s*r", land_text, re.IGNORECASE):
-        village_name = "अकलापूर"
+    # Split records by state marker ("MAHARASHTRA")
+    chunks = re.split(r"MAHARA[\s\n]*SHTRA", land_text, flags=re.IGNORECASE)
+    for c in chunks[1:]:
+        cells = [p.strip() for p in c.split("|") if p.strip()]
+        if len(cells) >= 4:
+            raw_d = "".join(cells[0].split())
+            raw_t = "".join(cells[1].split())
+            raw_v = "".join(cells[2].split())
+            raw_s = "".join(cells[3].split())
 
-    survey_match = re.search(r"Akalapu\s*r\s*\|\s*(\d+)", land_text, re.IGNORECASE)
-    if survey_match:
-        survey_no = survey_match.group(1).strip()
-    else:
-        s_match = re.search(r"\|\s*(\d{2,4})\s*\|\s*\*", land_text)
-        if s_match:
-            survey_no = s_match.group(1).strip()
+            # Map location names
+            d_val = "अहिल्यानगर" if "AHILYA" in raw_d.upper() else raw_d
+            t_val = "संगमनेर" if "SANGAM" in raw_t.upper() else raw_t
+            v_val = "अकलापूर" if "AKALAP" in raw_v.upper() else raw_v
+            s_val = raw_s if raw_s.isdigit() else "-"
 
-    area_match = re.search(r"(\d+\.\d{2,6})", land_text)
-    if area_match:
-        try:
-            area = f"{float(area_match.group(1)):.2f}"
-        except ValueError:
-            area = area_match.group(1)
+            # Extract area float
+            a_val = "-"
+            for p in cells[4:14]:
+                clean_num = "".join(p.replace(",", "").split())
+                area_m = re.search(r"(\d+\.\d{2,6})", clean_num)
+                if area_m:
+                    try:
+                        a_val = f"{float(area_m.group(1)):.2f}"
+                    except ValueError:
+                        a_val = area_m.group(1)
+                    break
+
+            if s_val != "-" or a_val != "-":
+                land_records.append({
+                    "district": d_val,
+                    "taluka": t_val,
+                    "village": v_val,
+                    "survey_no": s_val,
+                    "khata_no": "-",
+                    "area": a_val
+                })
+
+    # If no records were parsed, provide a single blank row
+    if not land_records:
+        land_records.append({
+            "district": "",
+            "taluka": "",
+            "village": "",
+            "survey_no": "",
+            "khata_no": "-",
+            "area": ""
+        })
 
     # 7. Photo Extraction
     photo_base64 = ""
@@ -239,12 +262,7 @@ def parse_agristack_pdf(pdf_bytes):
         "aadhaar_no": "",
         "address_en": address_en,
         "address_mr": address_mr,
-        "district": district_name,
-        "taluka": taluka_name,
-        "village": village_name,
-        "survey_no": survey_no,
-        "khata_no": "-",
-        "area": area,
+        "land_records": land_records,
         "photo_base64": photo_base64
     }
 
@@ -269,7 +287,6 @@ def get_cards_page_html(data):
     else:
         formatted_fid = raw_fid
 
-    # Generate QR Code dynamically from current confirmed inputs
     qr_payload = f"FarmerID:{raw_fid}|Name:{data.get('name_en', '')}|DOB:{data.get('dob', '')}"
     qr_base64 = generate_local_qr_base64(qr_payload)
 
@@ -278,6 +295,21 @@ def get_cards_page_html(data):
         header_logo_html = f'<img src="{logo_src}" style="height: 38px; width: auto; object-fit: contain; vertical-align: middle;" />'
     else:
         header_logo_html = '<div style="font-size: 20px; font-weight: 800; color: #fff;">AgriStack</div>'
+
+    # Build dynamic table rows for all land records
+    land_records = data.get("land_records", [])
+    land_rows_html = ""
+    for r in land_records:
+        land_rows_html += f"""
+        <tr>
+            <td>{r.get('district') or '-'}</td>
+            <td>{r.get('taluka') or '-'}</td>
+            <td>{r.get('village') or '-'}</td>
+            <td>{r.get('survey_no') or '-'}</td>
+            <td>{r.get('khata_no') or '-'}</td>
+            <td>{r.get('area') or '-'}</td>
+        </tr>
+        """
 
     return f"""
     <!DOCTYPE html>
@@ -333,21 +365,25 @@ def get_cards_page_html(data):
                 color: #ffffff; font-size: 26px; font-weight: 800; letter-spacing: 2.5px; line-height: 1;
             }}
 
-            .card-back {{ padding: 14px 22px; border: 2px solid #1B4D3E; }}
-            .sec-title {{ font-size: 15px; font-weight: 800; color: #1B4D3E; margin-bottom: 2px; }}
-            .address-box {{ margin-bottom: 12px; }}
-            .address-mr {{ font-size: 13px; color: #111; font-weight: 700; line-height: 1.25; }}
-            .address-en {{ font-size: 11.5px; color: #444; font-weight: 600; line-height: 1.25; margin-top: 2px; }}
-            .table-container {{ width: 100%; border-collapse: collapse; margin-top: 4px; }}
+            .card-back {{ padding: 12px 20px; border: 2px solid #1B4D3E; }}
+            .sec-title {{ font-size: 14.5px; font-weight: 800; color: #1B4D3E; margin-bottom: 1px; }}
+            .address-box {{ margin-bottom: 8px; }}
+            .address-mr {{ font-size: 12.5px; color: #111; font-weight: 700; line-height: 1.25; }}
+            .address-en {{ font-size: 11px; color: #444; font-weight: 600; line-height: 1.25; margin-top: 1px; }}
+            
+            .table-container {{ width: 100%; border-collapse: collapse; margin-top: 2px; }}
             .table-container th {{
-                color: #1B4D3E; font-size: 12.5px; font-weight: 700; text-align: left;
-                padding-bottom: 4px; border-bottom: 1.5px solid #bbb;
+                color: #1B4D3E; font-size: 11px; font-weight: 700; text-align: left;
+                padding-bottom: 2px; border-bottom: 1.5px solid #bbb;
             }}
-            .table-container td {{ padding-top: 6px; font-size: 12.5px; font-weight: 600; color: #222; }}
+            .table-container td {{
+                padding: 2.5px 0; font-size: 11px; font-weight: 600; color: #222;
+                border-bottom: 0.5px solid #f0f0f0;
+            }}
             .disclaimer {{
-                position: absolute; bottom: 10px; left: 0; right: 0; text-align: center;
-                font-size: 11px; color: #555; font-weight: 600;
-                border-top: 1px solid #ccc; padding-top: 5px; margin: 0 20px;
+                position: absolute; bottom: 8px; left: 0; right: 0; text-align: center;
+                font-size: 10.5px; color: #555; font-weight: 600;
+                border-top: 1px solid #ccc; padding-top: 3px; margin: 0 20px;
             }}
         </style>
     </head>
@@ -362,11 +398,11 @@ def get_cards_page_html(data):
                     {photo_tag}
                 </div>
                 <div class="details">
-                    <div><span class="field-label">नाव :</span> <span class="name-mr">{data.get('name_mr', '-')}</span></div>
-                    <div class="name-en" style="padding-left: 38px;">{data.get('name_en', '-')}</div>
-                    <div class="field-row"><span class="field-label">जन्म दिनांक / DOB :</span> {data.get('dob', '-')}</div>
-                    <div class="field-row"><span class="field-label">लिंग / Gender :</span> {data.get('gender', '-')}</div>
-                    <div class="field-row"><span class="field-label">मोबाइल / Mobile :</span> {data.get('mobile', '-')}</div>
+                    <div><span class="field-label">नाव :</span> <span class="name-mr">{data.get('name_mr') or '-'}</span></div>
+                    <div class="name-en" style="padding-left: 38px;">{data.get('name_en') or '-'}</div>
+                    <div class="field-row"><span class="field-label">जन्म दिनांक / DOB :</span> {data.get('dob') or '-'}</div>
+                    <div class="field-row"><span class="field-label">लिंग / Gender :</span> {data.get('gender') or '-'}</div>
+                    <div class="field-row"><span class="field-label">मोबाइल / Mobile :</span> {data.get('mobile') or '-'}</div>
                     <div class="field-row"><span class="field-label">आधार नं / Aadhaar No :</span> {aadhaar_display}</div>
                 </div>
                 <div class="qr-box">
@@ -382,8 +418,8 @@ def get_cards_page_html(data):
         <div id="card-back" class="card card-back">
             <div class="sec-title">संपूर्ण पत्ता / Address</div>
             <div class="address-box">
-                <div class="address-mr">{data.get('address_mr', '-')}</div>
-                <div class="address-en">{data.get('address_en', '-')}</div>
+                <div class="address-mr">{data.get('address_mr') or '-'}</div>
+                <div class="address-en">{data.get('address_en') or '-'}</div>
             </div>
 
             <div class="sec-title">जमिनीची माहिती / Land Details</div>
@@ -399,14 +435,7 @@ def get_cards_page_html(data):
                     </tr>
                 </thead>
                 <tbody>
-                    <tr>
-                        <td>{data.get('district', '-')}</td>
-                        <td>{data.get('taluka', '-')}</td>
-                        <td>{data.get('village', '-')}</td>
-                        <td>{data.get('survey_no', '-')}</td>
-                        <td>{data.get('khata_no', '-')}</td>
-                        <td>{data.get('area', '-')}</td>
-                    </tr>
+                    {land_rows_html}
                 </tbody>
             </table>
             <div class="disclaimer">
@@ -491,22 +520,21 @@ def main_dashboard():
 
     if uploaded_file is not None:
         file_bytes = uploaded_file.getvalue()
-        # Parse only when a new file is uploaded
         if st.session_state["last_processed_file"] != uploaded_file.name:
-            with st.spinner("Extracting farmer data and photo from PDF..."):
+            with st.spinner("Extracting farmer data, land parcels, and photo..."):
                 parsed = parse_agristack_pdf(file_bytes)
                 st.session_state["extracted_data"] = parsed
                 st.session_state["last_processed_file"] = uploaded_file.name
                 st.session_state["card_front"] = None
                 st.session_state["card_back"] = None
-                st.success("Data extracted successfully! Review and edit fields below.")
+                st.success("Data extracted successfully! Review and edit details below.")
 
     # STEP 2: EDITABLE VERIFICATION FORM (FRONT & BACK SECTIONS)
     if st.session_state["extracted_data"] is not None:
         d = st.session_state["extracted_data"]
         st.markdown("---")
         st.markdown("### ✏️ Step 2: Verify & Edit Card Details")
-        st.caption("You can modify extracted fields or manually fill missing values before generating the card.")
+        st.caption("You can modify extracted fields, add/delete land records (+ button), or fill in missing info before generating.")
 
         with st.form("card_edit_form"):
             col_front_form, col_back_form = st.columns(2)
@@ -526,22 +554,36 @@ def main_dashboard():
                 val_addr_mr = st.text_area("संपूर्ण पत्ता (Marathi Address)", value=d.get("address_mr", ""), height=80)
                 val_addr_en = st.text_area("Address in English", value=d.get("address_en", ""), height=80)
                 
-                st.markdown("##### 🌾 जमिनीची माहिती (Land Details)")
-                col_l1, col_l2 = st.columns(2)
-                with col_l1:
-                    val_district = st.text_input("जिल्हा (District)", value=d.get("district", ""))
-                    val_taluka = st.text_input("तालुका (Taluka)", value=d.get("taluka", ""))
-                    val_village = st.text_input("गाव (Village)", value=d.get("village", ""))
-                with col_l2:
-                    val_survey = st.text_input("गट नं. / Survey No.", value=d.get("survey_no", ""))
-                    val_khata = st.text_input("खाते नं. / Khata No.", value=d.get("khata_no", "-"))
-                    val_area = st.text_input("क्षेत्र (Area in Hectare)", value=d.get("area", ""))
+                st.markdown("##### 🌾 जमिनीची माहिती (Multiple Land Records)")
+                st.caption("Edit directly, or use the bottom row to add new land parcels:")
 
-            # Form submit button
+                # Prepare DataFrame for multi-record editor
+                initial_land = d.get("land_records", [])
+                if not initial_land:
+                    initial_land = [{"district": "", "taluka": "", "village": "", "survey_no": "", "khata_no": "-", "area": ""}]
+                df_land = pd.DataFrame(initial_land)
+
+                edited_df_land = st.data_editor(
+                    df_land,
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    column_config={
+                        "district": st.column_config.TextColumn("जिल्हा (District)"),
+                        "taluka": st.column_config.TextColumn("तालुका (Taluka)"),
+                        "village": st.column_config.TextColumn("गाव (Village)"),
+                        "survey_no": st.column_config.TextColumn("गट नं. (Survey No.)"),
+                        "khata_no": st.column_config.TextColumn("खाते नं. (Khata No.)"),
+                        "area": st.column_config.TextColumn("क्षेत्र (Area in Ha)")
+                    }
+                )
+
+            # Submit & Render button
             btn_generate = st.form_submit_button("✨ Generate & Preview Card", use_container_width=True)
 
         if btn_generate:
             with st.spinner("Rendering ID cards..."):
+                updated_land_records = edited_df_land.to_dict(orient="records")
+
                 final_data = {
                     "farmer_id": val_farmer_id or "-",
                     "name_mr": val_name_mr or "-",
@@ -552,16 +594,10 @@ def main_dashboard():
                     "aadhaar_no": val_aadhaar,
                     "address_mr": val_addr_mr or "-",
                     "address_en": val_addr_en or "-",
-                    "district": val_district or "-",
-                    "taluka": val_taluka or "-",
-                    "village": val_village or "-",
-                    "survey_no": val_survey or "-",
-                    "khata_no": val_khata or "-",
-                    "area": val_area or "-",
+                    "land_records": updated_land_records,
                     "photo_base64": d.get("photo_base64", "")
                 }
 
-                # Update state so edits persist
                 st.session_state["extracted_data"] = final_data
                 full_html = get_cards_page_html(final_data)
                 front_png, back_png = render_cards_fast(full_html)
