@@ -225,14 +225,14 @@ def parse_agristack_pdf(pdf_bytes):
             "area": ""
         })
 
-    # 7. High-Precision Photo Extraction (Pushed below header text)
+    # 7. Exact Full-Head Photo Extraction
     photo_base64 = ""
     try:
         w = page1.rect.width
         h = page1.rect.height
         
-        # y0 adjusted down to 0.245 to avoid "Farmer Photograph" text
-        clip_rect = fitz.Rect(w * 0.885, h * 0.245, w * 0.975, h * 0.380)
+        # 0.205 to 0.380 captures full head, hair, and collar without header text
+        clip_rect = fitz.Rect(w * 0.880, h * 0.205, w * 0.980, h * 0.380)
         pix = page1.get_pixmap(clip=clip_rect, dpi=300)
         photo_base64 = base64.b64encode(pix.tobytes("jpeg")).decode("utf-8")
     except Exception as e:
@@ -534,14 +534,22 @@ def main_dashboard():
                 val_mobile = st.text_input("Mobile Number", value=d.get("mobile", ""))
                 val_aadhaar = st.text_input("Aadhaar Number", value=d.get("aadhaar_no", ""), placeholder="Enter 12-digit number")
 
-                # Photo Management & Fine-tuning
+                # Photo Management & Interactive 4-Way Fine-Tuning
                 st.markdown("##### 📷 Photo Preview & Fine-Tune")
                 current_photo = d.get("photo_base64", "")
                 if current_photo:
-                    st.image(f"data:image/jpeg;base64,{current_photo}", width=110)
-                
+                    st.image(f"data:image/jpeg;base64,{current_photo}", width=120)
+
                 custom_photo_file = st.file_uploader("Replace Photo (Optional)", type=["jpg", "jpeg", "png"])
-                crop_top_offset = st.slider("Top Crop Offset (Trim Header Text)", min_value=0, max_value=40, value=0, help="Move slider right to trim off extra top border or text.")
+                
+                st.caption("Fine-tune crop offsets (Trim excess border or adjust centering):")
+                p_c1, p_c2 = st.columns(2)
+                with p_c1:
+                    trim_top = st.slider("Trim Top (%)", min_value=0, max_value=30, value=0)
+                    trim_bottom = st.slider("Trim Bottom (%)", min_value=0, max_value=30, value=0)
+                with p_c2:
+                    trim_left = st.slider("Trim Left (%)", min_value=0, max_value=30, value=0)
+                    trim_right = st.slider("Trim Right (%)", min_value=0, max_value=30, value=0)
 
             with col_back_form:
                 st.markdown("#### 🏡 Back Card Fields")
@@ -579,13 +587,18 @@ def main_dashboard():
                 # If user uploaded a new replacement photo
                 if custom_photo_file is not None:
                     final_photo_b64 = base64.b64encode(custom_photo_file.getvalue()).decode("utf-8")
-                elif current_photo and crop_top_offset > 0:
-                    # Apply user's manual top trim slider
+                elif current_photo and (trim_top > 0 or trim_bottom > 0 or trim_left > 0 or trim_right > 0):
+                    # Apply 4-way manual crop fine-tuning
                     try:
                         raw_img = Image.open(io.BytesIO(base64.b64decode(current_photo)))
                         w_img, h_img = raw_img.size
-                        trim_px = int((crop_top_offset / 100.0) * h_img)
-                        cropped = raw_img.crop((0, trim_px, w_img, h_img))
+                        crop_box = (
+                            int((trim_left / 100.0) * w_img),
+                            int((trim_top / 100.0) * h_img),
+                            int(w_img - ((trim_right / 100.0) * w_img)),
+                            int(h_img - ((trim_bottom / 100.0) * h_img))
+                        )
+                        cropped = raw_img.crop(crop_box)
                         buf = io.BytesIO()
                         cropped.save(buf, format="JPEG")
                         final_photo_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
