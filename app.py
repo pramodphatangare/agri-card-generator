@@ -5,6 +5,8 @@ import re
 import shutil
 import subprocess
 import fitz  # PyMuPDF
+from PIL import Image
+import pytesseract
 import qrcode
 from playwright.sync_api import sync_playwright
 import streamlit as st
@@ -31,22 +33,21 @@ if "card_back" not in st.session_state:
 if "farmer_data" not in st.session_state:
     st.session_state["farmer_data"] = None
 
-# ----------------- 2. PLAYWRIGHT CONTAINER SETUP -----------------
+# ----------------- 2. CONTAINER STARTUP SETUP -----------------
 
 @st.cache_resource
-def ensure_playwright_installed():
-    """Ensures Chromium binaries are installed on the cloud container once at startup."""
+def ensure_environment_ready():
+    """Installs Chromium binaries on the container if missing."""
     try:
         subprocess.run(["playwright", "install", "chromium"], check=True)
     except Exception:
         pass
 
-ensure_playwright_installed()
+ensure_environment_ready()
 
 # ----------------- 3. LOCAL ASSET ENGINES -----------------
 
 def get_local_logo_base64():
-    """Reads the logo from the local directory and converts it to Base64."""
     for filename in [LOGO_FILENAME, "logo.jpg", "logo.jpeg", "logo.webp"]:
         if os.path.exists(filename):
             try:
@@ -74,17 +75,39 @@ def generate_local_qr_base64(data_text):
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-# ----------------- 4. RESILIENT DYNAMIC PARSER -----------------
+# ----------------- 4. HYBRID OCR & PDF EXTRACTION ENGINE -----------------
+
+def extract_text_hybrid(doc):
+    """Extracts digital text or runs OCR on scanned pages."""
+    text_chunks = [page.get_text("text") for page in doc]
+    full_text = "\n".join(text_chunks).strip()
+
+    # If digital text layer is empty or scanned image
+    if len(full_text) < 50:
+        ocr_pages = []
+        for i in range(min(2, len(doc))):
+            page = doc[i]
+            pix = page.get_pixmap(dpi=200)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            try:
+                txt = pytesseract.image_to_string(img, lang="eng+mar")
+            except Exception:
+                try:
+                    txt = pytesseract.image_to_string(img, lang="eng")
+                except Exception:
+                    txt = ""
+            ocr_pages.append(txt)
+        full_text = "\n".join(ocr_pages)
+
+    return full_text
 
 def parse_agristack_pdf(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page1 = doc[0]
 
-    # Extract text from all pages
-    page_texts = [page.get_text("text") for page in doc]
-    full_text = "\n".join(page_texts)
+    full_text = extract_text_hybrid(doc)
 
-    # 1. Farmer ID (11 digits, resilient to line breaks between label and value)
+    # 1. Farmer ID (11-digit pattern)
     farmer_id = "-"
     fid_match = re.search(r"Farmer ID[\s\S]{0,120}?(\d{11})", full_text, re.IGNORECASE)
     if fid_match:
@@ -94,7 +117,7 @@ def parse_agristack_pdf(pdf_bytes):
         if all_fids:
             farmer_id = all_fids[0]
 
-    # 2. English Name (captures multi-line wraps like 'Barakubai\nParbhati Sable')
+    # 2. English Name
     name_en = "-"
     name_en_match = re.search(
         r"Farmer Name as per Aadhaar in English\s*([\s\S]*?)(?:Farmer[’']?s?\s*Name in Local Language|Gender|\n\s*\|)",
@@ -106,7 +129,7 @@ def parse_agristack_pdf(pdf_bytes):
         if tokens:
             name_en = " ".join(tokens)
 
-    # 3. Marathi / Local Language Name
+    # 3. Marathi / Local Name
     name_mr = "-"
     name_mr_match = re.search(
         r"Name in Local Language\s*([\s\S]*?)(?:Gender|Date of Birth|Identifier|Caste Category|\n\s*\|)",
@@ -128,7 +151,7 @@ def parse_agristack_pdf(pdf_bytes):
     mobile_match = re.search(r"Mobile Number\s*[:]?\s*(\d{10})", full_text, re.IGNORECASE)
     mobile = mobile_match.group(1).strip() if mobile_match else "-"
 
-    # 5. Addresses (English & Marathi)
+    # 5. Addresses
     address_en = "-"
     addr_en_match = re.search(
         r"Address In English\s*([\s\S]*?)(?:Farmer type|Address In Local Language|Occupations)",
@@ -151,7 +174,7 @@ def parse_agristack_pdf(pdf_bytes):
         if clean_mr:
             address_mr = clean_mr
 
-    # 6. Land Details Parsing (Table pipe tokenization)
+    # 6. Land Details Parsing
     district_name = "-"
     taluka_name = "-"
     village_name = "-"
@@ -169,27 +192,11 @@ def parse_agristack_pdf(pdf_bytes):
             raw_v = "".join(parts[3].split())
             raw_s = "".join(parts[4].split())
 
-            # District mapping
-            if "AHILYA" in raw_d.upper():
-                district_name = "अहिल्यानगर"
-            else:
-                district_name = raw_d or "-"
-
-            # Taluka mapping
-            if "SANGAM" in raw_t.upper():
-                taluka_name = "संगमनेर"
-            else:
-                taluka_name = raw_t or "-"
-
-            # Village mapping
-            if "AKALAP" in raw_v.upper():
-                village_name = "अकलापूर"
-            else:
-                village_name = raw_v or "-"
-
+            district_name = "अहिल्यानगर" if "AHILYA" in raw_d.upper() else (raw_d or "-")
+            taluka_name = "संगमनेर" if "SANGAM" in raw_t.upper() else (raw_t or "-")
+            village_name = "अकलापूर" if "AKALAP" in raw_v.upper() else (raw_v or "-")
             survey_no = raw_s or "-"
 
-            # Find area float among the remaining cells
             for p in parts[5:14]:
                 clean_num = "".join(p.replace(",", "").split())
                 area_match = re.search(r"(\d+\.\d+)", clean_num)
@@ -223,7 +230,6 @@ def parse_agristack_pdf(pdf_bytes):
     except Exception as e:
         st.warning(f"Photo extraction notice: {e}")
 
-    # 8. Local QR Generation
     qr_payload = f"FarmerID:{farmer_id}|Name:{name_en}|DOB:{dob}"
     qr_base64 = generate_local_qr_base64(qr_payload)
 
@@ -407,7 +413,7 @@ def get_cards_page_html(data):
 # ----------------- 6. ROBUST RENDER ENGINE -----------------
 
 def render_cards_fast(html_content):
-    ensure_playwright_installed()
+    ensure_environment_ready()
     
     system_chromium = shutil.which("chromium") or shutil.which("chromium-browser")
 
@@ -489,53 +495,4 @@ def main_dashboard():
         submitted = st.form_submit_button("Generate Card")
 
     if submitted:
-        if uploaded_file is None:
-            st.error("Please upload the registration PDF first.")
-        else:
-            with st.spinner("Extracting details and generating cards..."):
-                # Use getvalue() so the file buffer is read reliably every time
-                pdf_bytes = uploaded_file.getvalue()
-                farmer_data = parse_agristack_pdf(pdf_bytes)
-                farmer_data["aadhaar_no"] = user_aadhaar
-
-                full_html = get_cards_page_html(farmer_data)
-                front_png, back_png = render_cards_fast(full_html)
-
-                st.session_state["card_front"] = front_png
-                st.session_state["card_back"] = back_png
-                st.session_state["farmer_data"] = farmer_data
-
-    if st.session_state["card_front"] is not None and st.session_state["card_back"] is not None:
-        data = st.session_state["farmer_data"]
-        st.success(f"Card ready for: **{data['name_mr']}** ({data['name_en']})")
-
-        with st.expander("🔍 View Extracted Fields (Diagnostics)"):
-            st.json({k: v for k, v in data.items() if k not in ["photo_base64", "qr_base64"]})
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Front Side")
-            st.image(st.session_state["card_front"], use_container_width=True)
-            st.download_button(
-                label="Download Front",
-                data=st.session_state["card_front"],
-                file_name=f"{data['farmer_id']}_front.png",
-                mime="image/png",
-                key="btn_download_front"
-            )
-
-        with col2:
-            st.subheader("Back Side")
-            st.image(st.session_state["card_back"], use_container_width=True)
-            st.download_button(
-                label="Download Back",
-                data=st.session_state["card_back"],
-                file_name=f"{data['farmer_id']}_back.png",
-                mime="image/png",
-                key="btn_download_back"
-            )
-
-if not st.session_state["authenticated"]:
-    login_page()
-else:
-    main_dashboard()
+        if uploaded

@@ -3,3 +3,4 @@ PyMuPDF
 playwright
 qrcode
 pillow
+pytesseract

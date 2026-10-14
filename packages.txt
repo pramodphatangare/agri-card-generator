@@ -1,6 +1,10 @@
+tesseract-ocr
+tesseract-ocr-mar
+tesseract-ocr-eng
 fonts-deva
 fonts-indic
 fonts-noto-core
+chromium
 libnss3
 libnspr4
 libatk1.0-0
