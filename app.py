@@ -79,7 +79,7 @@ def generate_local_qr_base64(data_text):
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-# ----------------- 4. HYBRID OCR & MULTI-RECORD PARSER -----------------
+# ----------------- 4. HYBRID OCR & ACCURATE PARSER -----------------
 
 def extract_text_hybrid(doc):
     text_chunks = [page.get_text("text") for page in doc]
@@ -180,7 +180,6 @@ def parse_agristack_pdf(pdf_bytes):
     land_block_match = re.search(r"Land Ownership Details[\s\S]*?(?=Annexure|Consent|$)", full_text, re.IGNORECASE)
     land_text = land_block_match.group(0) if land_block_match else full_text
 
-    # Split records by state marker ("MAHARASHTRA")
     chunks = re.split(r"MAHARA[\s\n]*SHTRA", land_text, flags=re.IGNORECASE)
     for c in chunks[1:]:
         cells = [p.strip() for p in c.split("|") if p.strip()]
@@ -190,13 +189,11 @@ def parse_agristack_pdf(pdf_bytes):
             raw_v = "".join(cells[2].split())
             raw_s = "".join(cells[3].split())
 
-            # Map location names
             d_val = "अहिल्यानगर" if "AHILYA" in raw_d.upper() else raw_d
             t_val = "संगमनेर" if "SANGAM" in raw_t.upper() else raw_t
             v_val = "अकलापूर" if "AKALAP" in raw_v.upper() else raw_v
             s_val = raw_s if raw_s.isdigit() else "-"
 
-            # Extract area float
             a_val = "-"
             for p in cells[4:14]:
                 clean_num = "".join(p.replace(",", "").split())
@@ -218,7 +215,6 @@ def parse_agristack_pdf(pdf_bytes):
                     "area": a_val
                 })
 
-    # If no records were parsed, provide a single blank row
     if not land_records:
         land_records.append({
             "district": "",
@@ -229,26 +225,16 @@ def parse_agristack_pdf(pdf_bytes):
             "area": ""
         })
 
-    # 7. Photo Extraction
+    # 7. High-Precision Photo Extraction (Pushed below header text)
     photo_base64 = ""
     try:
-        search_hits = page1.search_for("Farmer Photograph")
-        if search_hits:
-            h = search_hits[0]
-            clip_rect = fitz.Rect(
-                h.x0 + 66,
-                h.y1 + 32,
-                h.x0 + 132,
-                h.y1 + 104
-            )
-            pix = page1.get_pixmap(clip=clip_rect, dpi=300)
-            photo_base64 = base64.b64encode(pix.tobytes("jpeg")).decode("utf-8")
-        else:
-            w = page1.rect.width
-            h = page1.rect.height
-            clip_rect = fitz.Rect(w * 0.88, h * 0.18, w * 0.98, h * 0.35)
-            pix = page1.get_pixmap(clip=clip_rect, dpi=300)
-            photo_base64 = base64.b64encode(pix.tobytes("jpeg")).decode("utf-8")
+        w = page1.rect.width
+        h = page1.rect.height
+        
+        # y0 adjusted down to 0.245 to avoid "Farmer Photograph" text
+        clip_rect = fitz.Rect(w * 0.885, h * 0.245, w * 0.975, h * 0.380)
+        pix = page1.get_pixmap(clip=clip_rect, dpi=300)
+        photo_base64 = base64.b64encode(pix.tobytes("jpeg")).decode("utf-8")
     except Exception as e:
         st.warning(f"Photo extraction notice: {e}")
 
@@ -279,7 +265,7 @@ def get_cards_page_html(data):
         else:
             aadhaar_display = aadhaar_val
     else:
-        aadhaar_display = "-"
+        aadhaar_display = "[Aadhaar Redacted]"
 
     raw_fid = data.get("farmer_id", "-")
     if len(raw_fid) == 11:
@@ -296,7 +282,6 @@ def get_cards_page_html(data):
     else:
         header_logo_html = '<div style="font-size: 20px; font-weight: 800; color: #fff;">AgriStack</div>'
 
-    # Build dynamic table rows for all land records
     land_records = data.get("land_records", [])
     land_rows_html = ""
     for r in land_records:
@@ -529,12 +514,12 @@ def main_dashboard():
                 st.session_state["card_back"] = None
                 st.success("Data extracted successfully! Review and edit details below.")
 
-    # STEP 2: EDITABLE VERIFICATION FORM (FRONT & BACK SECTIONS)
+    # STEP 2: EDITABLE VERIFICATION FORM
     if st.session_state["extracted_data"] is not None:
         d = st.session_state["extracted_data"]
         st.markdown("---")
         st.markdown("### ✏️ Step 2: Verify & Edit Card Details")
-        st.caption("You can modify extracted fields, add/delete land records (+ button), or fill in missing info before generating.")
+        st.caption("You can modify text fields, adjust/replace the photo, or edit the land records below.")
 
         with st.form("card_edit_form"):
             col_front_form, col_back_form = st.columns(2)
@@ -549,15 +534,23 @@ def main_dashboard():
                 val_mobile = st.text_input("Mobile Number", value=d.get("mobile", ""))
                 val_aadhaar = st.text_input("Aadhaar Number", value=d.get("aadhaar_no", ""), placeholder="Enter 12-digit number")
 
+                # Photo Management & Fine-tuning
+                st.markdown("##### 📷 Photo Preview & Fine-Tune")
+                current_photo = d.get("photo_base64", "")
+                if current_photo:
+                    st.image(f"data:image/jpeg;base64,{current_photo}", width=110)
+                
+                custom_photo_file = st.file_uploader("Replace Photo (Optional)", type=["jpg", "jpeg", "png"])
+                crop_top_offset = st.slider("Top Crop Offset (Trim Header Text)", min_value=0, max_value=40, value=0, help="Move slider right to trim off extra top border or text.")
+
             with col_back_form:
                 st.markdown("#### 🏡 Back Card Fields")
                 val_addr_mr = st.text_area("संपूर्ण पत्ता (Marathi Address)", value=d.get("address_mr", ""), height=80)
                 val_addr_en = st.text_area("Address in English", value=d.get("address_en", ""), height=80)
                 
                 st.markdown("##### 🌾 जमिनीची माहिती (Multiple Land Records)")
-                st.caption("Edit directly, or use the bottom row to add new land parcels:")
+                st.caption("Add, remove, or edit land parcel rows in the table below:")
 
-                # Prepare DataFrame for multi-record editor
                 initial_land = d.get("land_records", [])
                 if not initial_land:
                     initial_land = [{"district": "", "taluka": "", "village": "", "survey_no": "", "khata_no": "-", "area": ""}]
@@ -577,11 +570,28 @@ def main_dashboard():
                     }
                 )
 
-            # Submit & Render button
             btn_generate = st.form_submit_button("✨ Generate & Preview Card", use_container_width=True)
 
         if btn_generate:
             with st.spinner("Rendering ID cards..."):
+                final_photo_b64 = current_photo
+
+                # If user uploaded a new replacement photo
+                if custom_photo_file is not None:
+                    final_photo_b64 = base64.b64encode(custom_photo_file.getvalue()).decode("utf-8")
+                elif current_photo and crop_top_offset > 0:
+                    # Apply user's manual top trim slider
+                    try:
+                        raw_img = Image.open(io.BytesIO(base64.b64decode(current_photo)))
+                        w_img, h_img = raw_img.size
+                        trim_px = int((crop_top_offset / 100.0) * h_img)
+                        cropped = raw_img.crop((0, trim_px, w_img, h_img))
+                        buf = io.BytesIO()
+                        cropped.save(buf, format="JPEG")
+                        final_photo_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                    except Exception:
+                        pass
+
                 updated_land_records = edited_df_land.to_dict(orient="records")
 
                 final_data = {
@@ -595,7 +605,7 @@ def main_dashboard():
                     "address_mr": val_addr_mr or "-",
                     "address_en": val_addr_en or "-",
                     "land_records": updated_land_records,
-                    "photo_base64": d.get("photo_base64", "")
+                    "photo_base64": final_photo_b64
                 }
 
                 st.session_state["extracted_data"] = final_data
