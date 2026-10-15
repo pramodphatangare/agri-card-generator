@@ -29,8 +29,11 @@ if "authenticated" not in st.session_state:
 if "extracted_data" not in st.session_state:
     st.session_state["extracted_data"] = None
 
-if "card_front" not in st.session_state:
-    st.session_state["card_front"] = None
+if "card_front_preview" not in st.session_state:
+    st.session_state["card_front_preview"] = None
+
+if "card_front_clean" not in st.session_state:
+    st.session_state["card_front_clean"] = None
 
 if "card_back" not in st.session_state:
     st.session_state["card_back"] = None
@@ -83,11 +86,6 @@ def generate_local_qr_base64(data_text):
 # ----------------- 4. OCR PHOTO DETECTOR ENGINE -----------------
 
 def detect_and_crop_photo_ocr(page):
-    """
-    Renders the page to a 300 DPI image and uses OCR word coordinates
-    to detect 'Photograph' or 'Farmer' in the top-right header, then crops the
-    portrait box immediately below it without any header text overlap.
-    """
     try:
         pix = page.get_pixmap(dpi=300)
         img = Image.open(io.BytesIO(pix.tobytes("png")))
@@ -171,7 +169,6 @@ def parse_agristack_pdf(pdf_bytes):
 
     full_text = extract_text_hybrid(doc)
 
-    # 1. Farmer ID
     farmer_id = ""
     fid_match = re.search(r"Farmer ID[\s\S]{0,120}?(\d{11})", full_text, re.IGNORECASE)
     if fid_match:
@@ -181,18 +178,15 @@ def parse_agristack_pdf(pdf_bytes):
         if all_fids:
             farmer_id = all_fids[0]
 
-    # 2 & 3. Distinct Marathi and English Name Separation
     details_block = ""
     block_match = re.search(r"Farmer Details[\s\S]*?(?=Gender\b|Date of Birth\b)", full_text, re.IGNORECASE)
     if block_match:
         details_block = block_match.group(0)
 
-    # Marathi tokens only
     mr_tokens = re.findall(r"[\u0900-\u097F]+", details_block)
     filtered_mr = [w for w in mr_tokens if w not in ["शेतकऱ्याचे", "नाव", "स्थानिक", "भाषेत", "स्थानिकभाषेत", "तपशील"]]
     name_mr = " ".join(filtered_mr) if filtered_mr else ""
 
-    # English tokens only
     en_tokens = re.findall(r"[A-Za-z]+", details_block)
     filtered_en = [w for w in en_tokens if w.lower() not in [
         "farmer", "details", "name", "as", "per", "aadhaar", "in", "english", "local", "language", "gender", "caste"
@@ -204,7 +198,6 @@ def parse_agristack_pdf(pdf_bytes):
         if sig_match:
             name_en = " ".join(sig_match.group(1).split())
 
-    # 4. DOB, Gender, Mobile
     dob_match = re.search(r"Date of Birth\s*[:]?\s*(\d{2}/\d{2}/\d{4})", full_text, re.IGNORECASE)
     dob = dob_match.group(1).strip() if dob_match else ""
 
@@ -214,7 +207,6 @@ def parse_agristack_pdf(pdf_bytes):
     mobile_match = re.search(r"Mobile Number\s*[:]?\s*(\d{10})", full_text, re.IGNORECASE)
     mobile = mobile_match.group(1).strip() if mobile_match else ""
 
-    # 5. Addresses
     address_en = ""
     addr_en_match = re.search(
         r"Address In English\s*([\s\S]*?)(?:Farmer type|Address In Local Language|Occupations)",
@@ -237,7 +229,6 @@ def parse_agristack_pdf(pdf_bytes):
         if clean_mr:
             address_mr = clean_mr
 
-    # 6. Multi-Record Land Details Parsing
     land_records = []
     land_block_match = re.search(r"Land Ownership Details[\s\S]*?(?=Annexure|Consent|$)", full_text, re.IGNORECASE)
     land_text = land_block_match.group(0) if land_block_match else full_text
@@ -287,7 +278,6 @@ def parse_agristack_pdf(pdf_bytes):
             "area": ""
         })
 
-    # 7. Automated OCR Photo Finder
     photo_base64 = detect_and_crop_photo_ocr(page1)
 
     return {
@@ -304,7 +294,7 @@ def parse_agristack_pdf(pdf_bytes):
         "photo_base64": photo_base64
     }
 
-# ----------------- 6. COMBINED CARD HTML -----------------
+# ----------------- 6. COMBINED CARD HTML WITH WATERMARK SUPPORT -----------------
 
 def get_cards_page_html(data):
     photo_tag = f'<img src="data:image/jpeg;base64,{data["photo_base64"]}" style="width:100%; height:100%; object-fit:cover; object-position:center center; display:block;" />' if data.get("photo_base64") else '<div style="background:#eee;width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">No Photo</div>'
@@ -348,14 +338,45 @@ def get_cards_page_html(data):
         </tr>
         """
 
+    # Shared inner front card content
+    def generate_front_inner(is_preview=False):
+        watermark_div = '<div class="watermark">Pramod</div>' if is_preview else ''
+        return f"""
+            {watermark_div}
+            <div class="header">
+                <div>{header_logo_html}</div>
+                <div class="header-title">फार्मर आयडी कार्ड</div>
+            </div>
+            <div class="content">
+                <div class="photo-box">
+                    {photo_tag}
+                </div>
+                <div class="details">
+                    <div><span class="field-label">नाव :</span> <span class="name-mr">{data.get('name_mr') or '-'}</span></div>
+                    <div class="name-en">{data.get('name_en') or '-'}</div>
+                    <div class="field-row"><span class="field-label">जन्म दिनांक / DOB :</span> {data.get('dob') or '-'}</div>
+                    <div class="field-row"><span class="field-label">लिंग / Gender :</span> {data.get('gender') or '-'}</div>
+                    <div class="field-row"><span class="field-label">मोबाइल / Mobile :</span> {data.get('mobile') or '-'}</div>
+                    <div class="field-row"><span class="field-label">आधार नं / Aadhaar No :</span> {aadhaar_display}</div>
+                </div>
+                <div class="qr-box">
+                    <img src="data:image/png;base64,{qr_base64}" />
+                </div>
+            </div>
+            <div class="footer">
+                <span class="footer-text">फार्मर आयडी</span>
+                <span class="footer-id">{formatted_fid}</span>
+            </div>
+        """
+
     return f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <link href="https://fonts.googleapis.com/css2?family=Mukta:wght@400;600;700;800&display=swap" rel="stylesheet">
+        <link href="https://fonts.googleapis.com/css2?family=Great+Vibes&family=Mukta:wght@400;600;700;800&display=swap" rel="stylesheet">
         <style>
             * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: 'Mukta', sans-serif; }}
-            body {{ background: transparent; padding: 10px; display: flex; flex-direction: column; gap: 20px; }}
+            body {{ background: transparent; padding: 10px; display: flex; flex-direction: column; gap: 24px; }}
             
             .card {{
                 width: 506px; height: 319px; background: #ffffff;
@@ -369,25 +390,50 @@ def get_cards_page_html(data):
             .header-title {{
                 font-size: 23px; font-weight: 700; display: flex; align-items: center;
             }}
-            .content {{ display: flex; padding: 12px 18px; gap: 14px; }}
+            .content {{
+                display: flex; padding: 14px 18px 10px 18px; gap: 14px;
+                align-items: flex-start;
+            }}
             .photo-box {{
-                width: 105px; height: 130px; border: 1.5px solid #666;
+                width: 110px; height: 148px; border: 1.5px solid #666;
                 border-radius: 4px; overflow: hidden; flex-shrink: 0; background: #ffffff;
                 display: flex; align-items: center; justify-content: center;
             }}
             .details {{
                 flex-grow: 1;
-                max-width: 250px;
-                font-size: 13.5px;
-                line-height: 1.35;
+                max-width: 255px;
+                display: flex;
+                flex-direction: column;
+                justify-content: space-between;
                 color: #111;
             }}
-            .name-mr {{ font-size: 15.5px; font-weight: 700; color: #000; }}
-            .name-en {{ font-size: 13px; color: #333; font-weight: 600; margin-bottom: 2px; }}
-            .field-row {{ margin-top: 2px; font-weight: 600; font-size: 13px; }}
-            .field-label {{ color: #111; font-weight: 700; }}
-            .qr-box {{ position: absolute; right: 18px; top: 68px; width: 85px; height: 85px; }}
+            .name-mr {{ font-size: 17.5px; font-weight: 800; color: #000; line-height: 1.25; }}
+            .name-en {{ font-size: 14.5px; color: #333; font-weight: 600; margin-top: 1px; margin-bottom: 4px; padding-left: 38px; }}
+            .field-row {{
+                margin-top: 6px;
+                font-weight: 600;
+                font-size: 14.5px;
+                line-height: 1.45;
+                color: #111;
+            }}
+            .field-label {{ color: #000; font-weight: 800; font-size: 14.5px; }}
+            .qr-box {{ position: absolute; right: 18px; top: 66px; width: 88px; height: 88px; }}
             .qr-box img {{ width: 100%; height: 100%; }}
+
+            /* Cursive Watermark */
+            .watermark {{
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%) rotate(-24deg);
+                font-family: 'Great Vibes', cursive;
+                font-size: 85px;
+                color: rgba(27, 77, 62, 0.14);
+                pointer-events: none;
+                z-index: 15;
+                white-space: nowrap;
+                user-select: none;
+            }}
 
             .footer {{
                 position: absolute; bottom: 0; left: 0; right: 0;
@@ -403,10 +449,10 @@ def get_cards_page_html(data):
             }}
 
             .card-back {{ padding: 12px 20px; border: 2px solid #1B4D3E; }}
-            .sec-title {{ font-size: 14.5px; font-weight: 800; color: #1B4D3E; margin-bottom: 1px; }}
+            .sec-title {{ font-size: 14.5px; font-weight: 800; color: #1B4D3E; margin-bottom: 2px; }}
             .address-box {{ margin-bottom: 8px; }}
-            .address-mr {{ font-size: 12.5px; color: #111; font-weight: 700; line-height: 1.25; }}
-            .address-en {{ font-size: 11px; color: #444; font-weight: 600; line-height: 1.25; margin-top: 1px; }}
+            .address-mr {{ font-size: 12.5px; color: #111; font-weight: 700; line-height: 1.3; }}
+            .address-en {{ font-size: 11px; color: #444; font-weight: 600; line-height: 1.3; margin-top: 1px; }}
             
             .table-container {{ width: 100%; border-collapse: collapse; margin-top: 2px; }}
             .table-container th {{
@@ -425,33 +471,17 @@ def get_cards_page_html(data):
         </style>
     </head>
     <body>
-        <div id="card-front" class="card">
-            <div class="header">
-                <div>{header_logo_html}</div>
-                <div class="header-title">फार्मर आयडी कार्ड</div>
-            </div>
-            <div class="content">
-                <div class="photo-box">
-                    {photo_tag}
-                </div>
-                <div class="details">
-                    <div><span class="field-label">नाव :</span> <span class="name-mr">{data.get('name_mr') or '-'}</span></div>
-                    <div class="name-en" style="padding-left: 38px;">{data.get('name_en') or '-'}</div>
-                    <div class="field-row"><span class="field-label">जन्म दिनांक / DOB :</span> {data.get('dob') or '-'}</div>
-                    <div class="field-row"><span class="field-label">लिंग / Gender :</span> {data.get('gender') or '-'}</div>
-                    <div class="field-row"><span class="field-label">मोबाइल / Mobile :</span> {data.get('mobile') or '-'}</div>
-                    <div class="field-row"><span class="field-label">आधार नं / Aadhaar No :</span> {aadhaar_display}</div>
-                </div>
-                <div class="qr-box">
-                    <img src="data:image/png;base64,{qr_base64}" />
-                </div>
-            </div>
-            <div class="footer">
-                <span class="footer-text">फार्मर आयडी</span>
-                <span class="footer-id">{formatted_fid}</span>
-            </div>
+        <!-- 1. PREVIEW FRONT CARD (WITH WATERMARK) -->
+        <div id="card-front-preview" class="card">
+            {generate_front_inner(is_preview=True)}
         </div>
 
+        <!-- 2. CLEAN FRONT CARD FOR DOWNLOAD (NO WATERMARK) -->
+        <div id="card-front-clean" class="card">
+            {generate_front_inner(is_preview=False)}
+        </div>
+
+        <!-- 3. BACK CARD -->
         <div id="card-back" class="card card-back">
             <div class="sec-title">संपूर्ण पत्ता / Address</div>
             <div class="address-box">
@@ -511,13 +541,17 @@ def render_cards_fast(html_content):
             launch_kwargs.pop("executable_path", None)
             browser = p.chromium.launch(**launch_kwargs)
 
-        page = browser.new_page(viewport={"width": 600, "height": 800}, device_scale_factor=2)
+        page = browser.new_page(viewport={"width": 600, "height": 1100}, device_scale_factor=2)
         page.set_content(html_content, wait_until="networkidle")
         page.evaluate("document.fonts.ready")
-        front_bytes = page.locator("#card-front").screenshot()
+
+        # Capture preview with watermark and clean version without watermark in one pass
+        front_preview_bytes = page.locator("#card-front-preview").screenshot()
+        front_clean_bytes = page.locator("#card-front-clean").screenshot()
         back_bytes = page.locator("#card-back").screenshot()
+
         browser.close()
-        return front_bytes, back_bytes
+        return front_preview_bytes, front_clean_bytes, back_bytes
 
 # ----------------- 8. UI ROUTING & STATE MANAGEMENT -----------------
 
@@ -546,7 +580,8 @@ def main_dashboard():
         if st.button("Sign Out"):
             st.session_state["authenticated"] = False
             st.session_state["extracted_data"] = None
-            st.session_state["card_front"] = None
+            st.session_state["card_front_preview"] = None
+            st.session_state["card_front_clean"] = None
             st.session_state["card_back"] = None
             st.session_state["last_processed_file"] = None
             st.rerun()
@@ -562,7 +597,8 @@ def main_dashboard():
                 parsed = parse_agristack_pdf(file_bytes)
                 st.session_state["extracted_data"] = parsed
                 st.session_state["last_processed_file"] = uploaded_file.name
-                st.session_state["card_front"] = None
+                st.session_state["card_front_preview"] = None
+                st.session_state["card_front_clean"] = None
                 st.session_state["card_back"] = None
                 st.success("Data and photo captured successfully! Review and edit details below.")
 
@@ -586,7 +622,6 @@ def main_dashboard():
                 val_mobile = st.text_input("Mobile Number", value=d.get("mobile", ""))
                 val_aadhaar = st.text_input("Aadhaar Number", value=d.get("aadhaar_no", ""), placeholder="Enter 12-digit number")
 
-                # Photo Preview & Optional Manual Replacement
                 st.markdown("##### 📷 Photo Preview")
                 current_photo = d.get("photo_base64", "")
                 if current_photo:
@@ -648,24 +683,25 @@ def main_dashboard():
 
                 st.session_state["extracted_data"] = final_data
                 full_html = get_cards_page_html(final_data)
-                front_png, back_png = render_cards_fast(full_html)
+                front_preview_png, front_clean_png, back_png = render_cards_fast(full_html)
 
-                st.session_state["card_front"] = front_png
+                st.session_state["card_front_preview"] = front_preview_png
+                st.session_state["card_front_clean"] = front_clean_png
                 st.session_state["card_back"] = back_png
 
     # STEP 3: PREVIEW & DOWNLOAD
-    if st.session_state["card_front"] is not None and st.session_state["card_back"] is not None:
+    if st.session_state["card_front_preview"] is not None and st.session_state["card_back"] is not None:
         st.markdown("---")
         st.markdown("### 🖨️ Step 3: Preview & Download Card")
         data = st.session_state["extracted_data"]
 
         col1, col2 = st.columns(2)
         with col1:
-            st.subheader("Front Side")
-            st.image(st.session_state["card_front"], use_container_width=True)
+            st.subheader("Front Side (Preview with Watermark)")
+            st.image(st.session_state["card_front_preview"], use_container_width=True)
             st.download_button(
-                label="📥 Download Front Card",
-                data=st.session_state["card_front"],
+                label="📥 Download Clean Front Card (No Watermark)",
+                data=st.session_state["card_front_clean"],
                 file_name=f"{data['farmer_id']}_front.png",
                 mime="image/png",
                 key="btn_download_front",
