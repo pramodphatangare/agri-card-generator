@@ -524,8 +524,9 @@ def get_cards_page_html(data):
             }}
             .disclaimer {{
                 position: absolute; bottom: 8px; left: 0; right: 0; text-align: center;
-                font-size: 10.5px; color: #555; font-weight: 600;
-                border-top: 1px solid #ccc; padding-top: 3px; margin: 0 20px;
+                font-size: 11px; color: #1B4D3E; font-weight: 700;
+                border-top: 1px solid rgba(27, 77, 62, 0.35); padding-top: 4px; margin: 0 20px;
+                letter-spacing: 0.3px;
             }}
         </style>
     </head>
