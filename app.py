@@ -21,6 +21,7 @@ ADMIN_USERNAME = st.secrets.get("AUTH_USER", "admin")
 ADMIN_PASSWORD = st.secrets.get("AUTH_PASS", "agri@123")
 
 LOGO_FILENAME = "logo.png"
+LEAF_FILENAME = "leaf.png"
 
 # Session state initialization
 if "authenticated" not in st.session_state:
@@ -57,6 +58,20 @@ ensure_environment_ready()
 
 def get_local_logo_base64():
     for filename in [LOGO_FILENAME, "logo.jpg", "logo.jpeg", "logo.webp"]:
+        if os.path.exists(filename):
+            try:
+                with open(filename, "rb") as f:
+                    ext = filename.split(".")[-1].lower()
+                    mime = "jpeg" if ext in ["jpg", "jpeg"] else ext
+                    b64 = base64.b64encode(f.read()).decode("utf-8")
+                    return f"data:image/{mime};base64,{b64}"
+            except Exception:
+                pass
+    return None
+
+def get_local_leaf_base64():
+    """Reads leaf.png from local directory and converts it to Base64."""
+    for filename in [LEAF_FILENAME, "leaf.jpg", "leaf.jpeg", "leaf.webp"]:
         if os.path.exists(filename):
             try:
                 with open(filename, "rb") as f:
@@ -294,7 +309,7 @@ def parse_agristack_pdf(pdf_bytes):
         "photo_base64": photo_base64
     }
 
-# ----------------- 6. COMBINED CARD HTML WITH WATERMARK SUPPORT -----------------
+# ----------------- 6. COMBINED CARD HTML WITH LEAF LOGO & WATERMARK -----------------
 
 def get_cards_page_html(data):
     photo_tag = f'<img src="data:image/jpeg;base64,{data["photo_base64"]}" style="width:100%; height:100%; object-fit:cover; object-position:center center; display:block;" />' if data.get("photo_base64") else '<div style="background:#eee;width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">No Photo</div>'
@@ -318,11 +333,21 @@ def get_cards_page_html(data):
     qr_payload = f"FarmerID:{raw_fid}|Name:{data.get('name_en', '')}|DOB:{data.get('dob', '')}"
     qr_base64 = generate_local_qr_base64(qr_payload)
 
+    # Header Logo
     logo_src = get_local_logo_base64()
     if logo_src:
         header_logo_html = f'<img src="{logo_src}" style="height: 38px; width: auto; object-fit: contain; vertical-align: middle;" />'
     else:
         header_logo_html = '<div style="font-size: 20px; font-weight: 800; color: #fff;">AgriStack</div>'
+
+    # Leaf Image (Under Photo and on Back Card)
+    leaf_src = get_local_leaf_base64()
+    if leaf_src:
+        front_leaf_html = f'<div class="front-leaf-box"><img src="{leaf_src}" class="front-leaf-img" /></div>'
+        back_leaf_top_html = f'<div class="back-leaf-decor"><img src="{leaf_src}" style="width: 58px; height: auto; transform: rotate(-15deg); opacity: 0.85;" /></div>'
+    else:
+        front_leaf_html = '<div style="height: 48px;"></div>'
+        back_leaf_top_html = ''
 
     land_records = data.get("land_records", [])
     land_rows_html = ""
@@ -338,7 +363,6 @@ def get_cards_page_html(data):
         </tr>
         """
 
-    # Shared inner front card content
     def generate_front_inner(is_preview=False):
         watermark_div = '<div class="watermark">Pramod</div>' if is_preview else ''
         return f"""
@@ -348,8 +372,11 @@ def get_cards_page_html(data):
                 <div class="header-title">फार्मर आयडी कार्ड</div>
             </div>
             <div class="content">
-                <div class="photo-box">
-                    {photo_tag}
+                <div class="photo-column">
+                    <div class="photo-box">
+                        {photo_tag}
+                    </div>
+                    {front_leaf_html}
                 </div>
                 <div class="details">
                     <div><span class="field-label">नाव :</span> <span class="name-mr">{data.get('name_mr') or '-'}</span></div>
@@ -391,32 +418,56 @@ def get_cards_page_html(data):
                 font-size: 23px; font-weight: 700; display: flex; align-items: center;
             }}
             .content {{
-                display: flex; padding: 14px 18px 10px 18px; gap: 14px;
+                display: flex; padding: 12px 18px 8px 18px; gap: 14px;
                 align-items: flex-start;
             }}
+            
+            /* Photo column containing photo box + leaf underneath */
+            .photo-column {{
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                width: 108px;
+                flex-shrink: 0;
+            }}
             .photo-box {{
-                width: 110px; height: 148px; border: 1.5px solid #666;
-                border-radius: 4px; overflow: hidden; flex-shrink: 0; background: #ffffff;
+                width: 108px; height: 130px; border: 1.5px solid #666;
+                border-radius: 4px; overflow: hidden; background: #ffffff;
                 display: flex; align-items: center; justify-content: center;
             }}
+            .front-leaf-box {{
+                margin-top: 6px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                width: 100%;
+                height: 48px;
+            }}
+            .front-leaf-img {{
+                height: 44px;
+                width: auto;
+                object-fit: contain;
+                transform: rotate(-10deg);
+                filter: drop-shadow(0 1px 2px rgba(0,0,0,0.15));
+            }}
+
             .details {{
                 flex-grow: 1;
                 max-width: 255px;
                 display: flex;
                 flex-direction: column;
-                justify-content: space-between;
                 color: #111;
             }}
-            .name-mr {{ font-size: 17.5px; font-weight: 800; color: #000; line-height: 1.25; }}
-            .name-en {{ font-size: 14.5px; color: #333; font-weight: 600; margin-top: 1px; margin-bottom: 4px; padding-left: 38px; }}
+            .name-mr {{ font-size: 17px; font-weight: 800; color: #000; line-height: 1.25; }}
+            .name-en {{ font-size: 14px; color: #333; font-weight: 600; margin-top: 1px; margin-bottom: 2px; padding-left: 38px; }}
             .field-row {{
-                margin-top: 6px;
+                margin-top: 5px;
                 font-weight: 600;
-                font-size: 14.5px;
-                line-height: 1.45;
+                font-size: 14px;
+                line-height: 1.4;
                 color: #111;
             }}
-            .field-label {{ color: #000; font-weight: 800; font-size: 14.5px; }}
+            .field-label {{ color: #000; font-weight: 800; font-size: 14px; }}
             .qr-box {{ position: absolute; right: 18px; top: 66px; width: 88px; height: 88px; }}
             .qr-box img {{ width: 100%; height: 100%; }}
 
@@ -448,9 +499,17 @@ def get_cards_page_html(data):
                 color: #ffffff; font-size: 26px; font-weight: 800; letter-spacing: 2.5px; line-height: 1;
             }}
 
-            .card-back {{ padding: 12px 20px; border: 2px solid #1B4D3E; }}
+            /* Back Card Styling */
+            .card-back {{ padding: 12px 20px; border: 2px solid #1B4D3E; position: relative; }}
+            .back-leaf-decor {{
+                position: absolute;
+                top: 12px;
+                right: 20px;
+                pointer-events: none;
+                z-index: 2;
+            }}
             .sec-title {{ font-size: 14.5px; font-weight: 800; color: #1B4D3E; margin-bottom: 2px; }}
-            .address-box {{ margin-bottom: 8px; }}
+            .address-box {{ margin-bottom: 8px; max-width: 380px; }}
             .address-mr {{ font-size: 12.5px; color: #111; font-weight: 700; line-height: 1.3; }}
             .address-en {{ font-size: 11px; color: #444; font-weight: 600; line-height: 1.3; margin-top: 1px; }}
             
@@ -481,8 +540,9 @@ def get_cards_page_html(data):
             {generate_front_inner(is_preview=False)}
         </div>
 
-        <!-- 3. BACK CARD -->
+        <!-- 3. BACK CARD (WITH LEAF ACCENT) -->
         <div id="card-back" class="card card-back">
+            {back_leaf_top_html}
             <div class="sec-title">संपूर्ण पत्ता / Address</div>
             <div class="address-box">
                 <div class="address-mr">{data.get('address_mr') or '-'}</div>
@@ -545,7 +605,6 @@ def render_cards_fast(html_content):
         page.set_content(html_content, wait_until="networkidle")
         page.evaluate("document.fonts.ready")
 
-        # Capture preview with watermark and clean version without watermark in one pass
         front_preview_bytes = page.locator("#card-front-preview").screenshot()
         front_clean_bytes = page.locator("#card-front-clean").screenshot()
         back_bytes = page.locator("#card-back").screenshot()
