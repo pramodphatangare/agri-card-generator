@@ -4,3 +4,4 @@ playwright
 qrcode
 pillow
 pytesseract
+pandas
