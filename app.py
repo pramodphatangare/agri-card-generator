@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import zipfile
 import fitz  # PyMuPDF
 import pandas as pd
 from PIL import Image
@@ -97,6 +98,31 @@ def generate_local_qr_base64(data_text):
     buffered = io.BytesIO()
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+def create_combined_card_image(front_bytes, back_bytes):
+    """Combines Front and Back cards side-by-side into a single image."""
+    img_front = Image.open(io.BytesIO(front_bytes))
+    img_back = Image.open(io.BytesIO(back_bytes))
+    
+    gap = 40
+    total_w = img_front.width + img_back.width + gap
+    total_h = max(img_front.height, img_back.height)
+    
+    combined = Image.new("RGBA", (total_w, total_h), (255, 255, 255, 0))
+    combined.paste(img_front, (0, 0))
+    combined.paste(img_back, (img_front.width + gap, 0))
+    
+    buf = io.BytesIO()
+    combined.save(buf, format="PNG")
+    return buf.getvalue()
+
+def create_cards_zip(front_bytes, back_bytes, farmer_id):
+    """Packages both front and back cards into a single ZIP archive."""
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{farmer_id}_front.png", front_bytes)
+        zf.writestr(f"{farmer_id}_back.png", back_bytes)
+    return zip_buffer.getvalue()
 
 # ----------------- 4. OCR PHOTO DETECTOR ENGINE -----------------
 
@@ -309,7 +335,7 @@ def parse_agristack_pdf(pdf_bytes):
         "photo_base64": photo_base64
     }
 
-# ----------------- 6. COMBINED CARD HTML WITH LEAF LOGO & WATERMARK -----------------
+# ----------------- 6. COMBINED CARD HTML -----------------
 
 def get_cards_page_html(data):
     photo_tag = f'<img src="data:image/jpeg;base64,{data["photo_base64"]}" style="width:100%; height:100%; object-fit:cover; object-position:center center; display:block;" />' if data.get("photo_base64") else '<div style="background:#eee;width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">No Photo</div>'
@@ -333,21 +359,19 @@ def get_cards_page_html(data):
     qr_payload = f"FarmerID:{raw_fid}|Name:{data.get('name_en', '')}|DOB:{data.get('dob', '')}"
     qr_base64 = generate_local_qr_base64(qr_payload)
 
-    # Header Logo
     logo_src = get_local_logo_base64()
     if logo_src:
         header_logo_html = f'<img src="{logo_src}" style="height: 38px; width: auto; object-fit: contain; vertical-align: middle;" />'
     else:
         header_logo_html = '<div style="font-size: 20px; font-weight: 800; color: #fff;">AgriStack</div>'
 
-    # Leaf Image (Under Photo and on Back Card)
     leaf_src = get_local_leaf_base64()
     if leaf_src:
-        front_leaf_html = f'<div class="front-leaf-box"><img src="{leaf_src}" class="front-leaf-img" /></div>'
-        back_leaf_top_html = f'<div class="back-leaf-decor"><img src="{leaf_src}" style="width: 58px; height: auto; transform: rotate(-15deg); opacity: 0.85;" /></div>'
+        front_leaf_html = f'<div class="front-leaf-box"><img src="{leaf_src}" style="width: 52px; height: auto; object-fit: contain;" /></div>'
+        back_leaf_html = f'<div class="back-leaf-box"><img src="{leaf_src}" style="width: 56px; height: auto; object-fit: contain; opacity: 0.85;" /></div>'
     else:
-        front_leaf_html = '<div style="height: 48px;"></div>'
-        back_leaf_top_html = ''
+        front_leaf_html = ''
+        back_leaf_html = ''
 
     land_records = data.get("land_records", [])
     land_rows_html = ""
@@ -372,7 +396,7 @@ def get_cards_page_html(data):
                 <div class="header-title">फार्मर आयडी कार्ड</div>
             </div>
             <div class="content">
-                <div class="photo-column">
+                <div class="left-col">
                     <div class="photo-box">
                         {photo_tag}
                     </div>
@@ -422,33 +446,24 @@ def get_cards_page_html(data):
                 align-items: flex-start;
             }}
             
-            /* Photo column containing photo box + leaf underneath */
-            .photo-column {{
+            .left-col {{
                 display: flex;
                 flex-direction: column;
                 align-items: center;
-                width: 108px;
                 flex-shrink: 0;
+                width: 108px;
             }}
             .photo-box {{
-                width: 108px; height: 130px; border: 1.5px solid #666;
+                width: 108px; height: 124px; border: 1.5px solid #666;
                 border-radius: 4px; overflow: hidden; background: #ffffff;
                 display: flex; align-items: center; justify-content: center;
             }}
             .front-leaf-box {{
                 margin-top: 6px;
+                height: 48px;
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                width: 100%;
-                height: 48px;
-            }}
-            .front-leaf-img {{
-                height: 44px;
-                width: auto;
-                object-fit: contain;
-                transform: rotate(-10deg);
-                filter: drop-shadow(0 1px 2px rgba(0,0,0,0.15));
             }}
 
             .details {{
@@ -461,17 +476,16 @@ def get_cards_page_html(data):
             .name-mr {{ font-size: 17px; font-weight: 800; color: #000; line-height: 1.25; }}
             .name-en {{ font-size: 14px; color: #333; font-weight: 600; margin-top: 1px; margin-bottom: 2px; padding-left: 38px; }}
             .field-row {{
-                margin-top: 5px;
+                margin-top: 6px;
                 font-weight: 600;
-                font-size: 14px;
-                line-height: 1.4;
+                font-size: 14.5px;
+                line-height: 1.45;
                 color: #111;
             }}
-            .field-label {{ color: #000; font-weight: 800; font-size: 14px; }}
+            .field-label {{ color: #000; font-weight: 800; font-size: 14.5px; }}
             .qr-box {{ position: absolute; right: 18px; top: 66px; width: 88px; height: 88px; }}
             .qr-box img {{ width: 100%; height: 100%; }}
 
-            /* Cursive Watermark */
             .watermark {{
                 position: absolute;
                 top: 50%;
@@ -499,21 +513,19 @@ def get_cards_page_html(data):
                 color: #ffffff; font-size: 26px; font-weight: 800; letter-spacing: 2.5px; line-height: 1;
             }}
 
-            /* Back Card Styling */
-            .card-back {{ padding: 12px 20px; border: 2px solid #1B4D3E; position: relative; }}
-            .back-leaf-decor {{
+            .card-back {{ padding: 12px 20px; border: 2px solid #1B4D3E; }}
+            .back-leaf-box {{
                 position: absolute;
                 top: 12px;
                 right: 20px;
-                pointer-events: none;
-                z-index: 2;
+                z-index: 1;
             }}
             .sec-title {{ font-size: 14.5px; font-weight: 800; color: #1B4D3E; margin-bottom: 2px; }}
-            .address-box {{ margin-bottom: 8px; max-width: 380px; }}
+            .address-box {{ margin-bottom: 8px; }}
             .address-mr {{ font-size: 12.5px; color: #111; font-weight: 700; line-height: 1.3; }}
             .address-en {{ font-size: 11px; color: #444; font-weight: 600; line-height: 1.3; margin-top: 1px; }}
             
-            .table-container {{ width: 100%; border-collapse: collapse; margin-top: 2px; }}
+            .table-container {{ width: 100%; border-collapse: collapse; margin-top: 2px; position: relative; z-index: 2; }}
             .table-container th {{
                 color: #1B4D3E; font-size: 11px; font-weight: 700; text-align: left;
                 padding-bottom: 2px; border-bottom: 1.5px solid #bbb;
@@ -541,9 +553,9 @@ def get_cards_page_html(data):
             {generate_front_inner(is_preview=False)}
         </div>
 
-        <!-- 3. BACK CARD (WITH LEAF ACCENT) -->
+        <!-- 3. BACK CARD -->
         <div id="card-back" class="card card-back">
-            {back_leaf_top_html}
+            {back_leaf_html}
             <div class="sec-title">संपूर्ण पत्ता / Address</div>
             <div class="address-box">
                 <div class="address-mr">{data.get('address_mr') or '-'}</div>
@@ -759,26 +771,66 @@ def main_dashboard():
         with col1:
             st.subheader("Front Side (Preview with Watermark)")
             st.image(st.session_state["card_front_preview"], use_container_width=True)
-            st.download_button(
-                label="📥 Download Clean Front Card (No Watermark)",
-                data=st.session_state["card_front_clean"],
-                file_name=f"{data['farmer_id']}_front.png",
-                mime="image/png",
-                key="btn_download_front",
-                use_container_width=True
-            )
 
         with col2:
             st.subheader("Back Side")
             st.image(st.session_state["card_back"], use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("#### ⚡ Single-Click Downloads")
+
+        combined_png = create_combined_card_image(
+            st.session_state["card_front_clean"], 
+            st.session_state["card_back"]
+        )
+
+        cards_zip = create_cards_zip(
+            st.session_state["card_front_clean"],
+            st.session_state["card_back"],
+            data.get("farmer_id", "card")
+        )
+
+        col_zip, col_combo = st.columns(2)
+        with col_zip:
             st.download_button(
-                label="📥 Download Back Card",
-                data=st.session_state["card_back"],
-                file_name=f"{data['farmer_id']}_back.png",
-                mime="image/png",
-                key="btn_download_back",
+                label="📦 Download Both Cards (ZIP File)",
+                data=cards_zip,
+                file_name=f"{data.get('farmer_id', 'card')}_both_cards.zip",
+                mime="application/zip",
+                key="btn_download_zip",
                 use_container_width=True
             )
+
+        with col_combo:
+            st.download_button(
+                label="🖼️ Download Both Cards Side-by-Side (Single PNG)",
+                data=combined_png,
+                file_name=f"{data.get('farmer_id', 'card')}_combined.png",
+                mime="image/png",
+                key="btn_download_combined",
+                use_container_width=True
+            )
+
+        with st.expander("📄 Download Separate Files"):
+            col_d1, col_d2 = st.columns(2)
+            with col_d1:
+                st.download_button(
+                    label="📥 Download Clean Front Card",
+                    data=st.session_state["card_front_clean"],
+                    file_name=f"{data.get('farmer_id', 'card')}_front.png",
+                    mime="image/png",
+                    key="btn_download_front_ind",
+                    use_container_width=True
+                )
+            with col_d2:
+                st.download_button(
+                    label="📥 Download Back Card",
+                    data=st.session_state["card_back"],
+                    file_name=f"{data.get('farmer_id', 'card')}_back.png",
+                    mime="image/png",
+                    key="btn_download_back_ind",
+                    use_container_width=True
+                )
 
 if not st.session_state["authenticated"]:
     login_page()
