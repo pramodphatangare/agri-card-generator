@@ -6,7 +6,11 @@ import shutil
 import subprocess
 import time
 import zipfile
+import fitz  # PyMuPDF
+import pandas as pd
 from PIL import Image
+import pytesseract
+from pytesseract import Output
 import qrcode
 from playwright.sync_api import sync_playwright
 import streamlit as st
@@ -26,6 +30,11 @@ LOGO_FILENAME = "logo.png"
 LEAF_FILENAME = "leaf.png"
 CHROME_PROFILE_DIR = os.path.join(os.getcwd(), "chrome_csc_profile")
 
+# Detect if running in cloud container (Linux mount path)
+IS_CLOUD_ENV = os.path.exists("/mount/src") or "STREAMLIT_SERVER_PORT" in os.environ
+
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
 if "extracted_data" not in st.session_state:
     st.session_state["extracted_data"] = None
 if "card_front_preview" not in st.session_state:
@@ -34,8 +43,22 @@ if "card_front_clean" not in st.session_state:
     st.session_state["card_front_clean"] = None
 if "card_back" not in st.session_state:
     st.session_state["card_back"] = None
+if "last_processed_file" not in st.session_state:
+    st.session_state["last_processed_file"] = None
 
-# ----------------- 2. LOCAL ASSET LOADERS & PRINT ENGINES -----------------
+# ----------------- 2. CONTAINER STARTUP SETUP -----------------
+
+@st.cache_resource
+def ensure_environment_ready():
+    """Installs Chromium binaries on the container if missing."""
+    try:
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+    except Exception:
+        pass
+
+ensure_environment_ready()
+
+# ----------------- 3. LOCAL ASSET LOADERS & PRINT ENGINES -----------------
 
 def get_base64_asset(filename):
     if os.path.exists(filename):
@@ -58,7 +81,6 @@ def generate_local_qr_base64(data_text):
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 def create_a4_printable_sheet(front_bytes, back_bytes, as_pdf=True):
-    """Generates an A4 sheet (300 DPI) with Front and Back side-by-side."""
     a4_w, a4_h = 2480, 3508
     sheet = Image.new("RGB", (a4_w, a4_h), (255, 255, 255))
     
@@ -88,7 +110,218 @@ def make_zip(f, b, fid):
         zf.writestr(f"{fid}_back.png", b)
     return buf.getvalue()
 
-# ----------------- 3. PORTAL BACKGROUND AUTOMATION -----------------
+# ----------------- 4. OCR PHOTO DETECTOR ENGINE -----------------
+
+def detect_and_crop_photo_ocr(page):
+    try:
+        pix = page.get_pixmap(dpi=300)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        img_w, img_h = img.size
+
+        ocr_data = pytesseract.image_to_data(img, output_type=Output.DICT, lang="eng")
+        
+        target_x, target_y, target_w, target_h = None, None, None, None
+        n_boxes = len(ocr_data['text'])
+
+        for i in range(n_boxes):
+            text = ocr_data['text'][i].strip().lower()
+            x = ocr_data['left'][i]
+            y = ocr_data['top'][i]
+            w = ocr_data['width'][i]
+            h = ocr_data['height'][i]
+
+            if ("photo" in text or "graph" in text) and x > (img_w * 0.65) and y < (img_h * 0.40):
+                target_x, target_y, target_w, target_h = x, y, w, h
+                break
+
+        if target_x is None:
+            for i in range(n_boxes):
+                text = ocr_data['text'][i].strip().lower()
+                x = ocr_data['left'][i]
+                y = ocr_data['top'][i]
+                w = ocr_data['width'][i]
+                h = ocr_data['height'][i]
+                if text == "farmer" and x > (img_w * 0.70) and y < (img_h * 0.35):
+                    target_x, target_y, target_w, target_h = x, y, w, h
+                    break
+
+        if target_x is not None:
+            crop_top = target_y + target_h + int(img_h * 0.012)
+            crop_bottom = crop_top + int(img_h * 0.135)
+            center_x = target_x + (target_w // 2)
+            half_box_w = int(img_w * 0.048)
+            crop_left = max(0, center_x - half_box_w)
+            crop_right = min(img_w, center_x + half_box_w)
+
+            cropped = img.crop((crop_left, crop_top, crop_right, crop_bottom))
+            buf = io.BytesIO()
+            cropped.save(buf, format="JPEG")
+            return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        clip_rect = fitz.Rect(page.rect.width * 0.880, page.rect.height * 0.205, page.rect.width * 0.980, page.rect.height * 0.380)
+        fallback_pix = page.get_pixmap(clip=clip_rect, dpi=300)
+        return base64.b64encode(fallback_pix.tobytes("jpeg")).decode("utf-8")
+
+    except Exception as e:
+        st.warning(f"Photo detection note: {e}")
+        return ""
+
+# ----------------- 5. HYBRID OCR & ACCURATE PARSER -----------------
+
+def extract_text_hybrid(doc):
+    text_chunks = [page.get_text("text") for page in doc]
+    full_text = "\n".join(text_chunks).strip()
+
+    if len(full_text) < 50:
+        ocr_pages = []
+        for i in range(min(2, len(doc))):
+            page = doc[i]
+            pix = page.get_pixmap(dpi=200)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            try:
+                txt = pytesseract.image_to_string(img, lang="eng+mar")
+            except Exception:
+                try:
+                    txt = pytesseract.image_to_string(img, lang="eng")
+                except Exception:
+                    txt = ""
+            ocr_pages.append(txt)
+        full_text = "\n".join(ocr_pages)
+
+    return full_text
+
+def parse_agristack_pdf(pdf_bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page1 = doc[0]
+
+    full_text = extract_text_hybrid(doc)
+
+    farmer_id = ""
+    fid_match = re.search(r"Farmer ID[\s\S]{0,120}?(\d{11})", full_text, re.IGNORECASE)
+    if fid_match:
+        farmer_id = fid_match.group(1).strip()
+    else:
+        all_fids = re.findall(r"\b(\d{11})\b", full_text)
+        if all_fids:
+            farmer_id = all_fids[0]
+
+    details_block = ""
+    block_match = re.search(r"Farmer Details[\s\S]*?(?=Gender\b|Date of Birth\b)", full_text, re.IGNORECASE)
+    if block_match:
+        details_block = block_match.group(0)
+
+    mr_tokens = re.findall(r"[\u0900-\u097F]+", details_block)
+    filtered_mr = [w for w in mr_tokens if w not in ["शेतकऱ्याचे", "नाव", "स्थानिक", "भाषेत", "स्थानिकभाषेत", "तपशील"]]
+    name_mr = " ".join(filtered_mr) if filtered_mr else ""
+
+    en_tokens = re.findall(r"[A-Za-z]+", details_block)
+    filtered_en = [w for w in en_tokens if w.lower() not in [
+        "farmer", "details", "name", "as", "per", "aadhaar", "in", "english", "local", "language", "gender", "caste"
+    ]]
+    name_en = " ".join(filtered_en) if filtered_en else ""
+
+    if not name_en or len(name_en.split()) < 2:
+        sig_match = re.search(r"Farmer Name\s*\n\s*([A-Za-z\s]+)", full_text)
+        if sig_match:
+            name_en = " ".join(sig_match.group(1).split())
+
+    dob_match = re.search(r"Date of Birth\s*[:]?\s*(\d{2}/\d{2}/\d{4})", full_text, re.IGNORECASE)
+    dob = dob_match.group(1).strip() if dob_match else ""
+
+    gender_match = re.search(r"Gender\s*[:]?\s*([A-Za-z]+)", full_text, re.IGNORECASE)
+    gender = gender_match.group(1).strip() if gender_match else ""
+
+    mobile_match = re.search(r"Mobile Number\s*[:]?\s*(\d{10})", full_text, re.IGNORECASE)
+    mobile = mobile_match.group(1).strip() if mobile_match else ""
+
+    address_en = ""
+    addr_en_match = re.search(
+        r"Address In English\s*([\s\S]*?)(?:Farmer type|Address In Local Language|Occupations)",
+        full_text,
+        re.IGNORECASE
+    )
+    if addr_en_match:
+        clean_en = " ".join(addr_en_match.group(1).replace("|", " ").split())
+        if clean_en:
+            address_en = clean_en
+
+    address_mr = ""
+    addr_mr_match = re.search(
+        r"Address In Local Language\s*([\s\S]*?)(?:Occupations|Farmer type|Land Ownership Details|Consent|$)",
+        full_text,
+        re.IGNORECASE
+    )
+    if addr_mr_match:
+        clean_mr = " ".join(addr_mr_match.group(1).replace("|", " ").split())
+        if clean_mr:
+            address_mr = clean_mr
+
+    land_records = []
+    land_block_match = re.search(r"Land Ownership Details[\s\S]*?(?=Annexure|Consent|$)", full_text, re.IGNORECASE)
+    land_text = land_block_match.group(0) if land_block_match else full_text
+
+    chunks = re.split(r"MAHARA[\s\n]*SHTRA", land_text, flags=re.IGNORECASE)
+    for c in chunks[1:]:
+        cells = [p.strip() for p in c.split("|") if p.strip()]
+        if len(cells) >= 4:
+            raw_d = "".join(cells[0].split())
+            raw_t = "".join(cells[1].split())
+            raw_v = "".join(cells[2].split())
+            raw_s = "".join(cells[3].split())
+
+            d_val = "अहिल्यानगर" if "AHILYA" in raw_d.upper() else raw_d
+            t_val = "संगमनेर" if "SANGAM" in raw_t.upper() else raw_t
+            v_val = "अकलापूर" if "AKALAP" in raw_v.upper() else v_raw
+            s_val = raw_s if raw_s.isdigit() else "-"
+
+            a_val = "-"
+            for p in cells[4:14]:
+                clean_num = "".join(p.replace(",", "").split())
+                area_m = re.search(r"(\d+\.\d{2,6})", clean_num)
+                if area_m:
+                    try:
+                        a_val = f"{float(area_m.group(1)):.2f}"
+                    except ValueError:
+                        a_val = area_m.group(1)
+                    break
+
+            if s_val != "-" or a_val != "-":
+                land_records.append({
+                    "district": d_val,
+                    "taluka": t_val,
+                    "village": v_val,
+                    "survey_no": s_val,
+                    "khata_no": "-",
+                    "area": a_val
+                })
+
+    if not land_records:
+        land_records.append({
+            "district": "",
+            "taluka": "",
+            "village": "",
+            "survey_no": "",
+            "khata_no": "-",
+            "area": ""
+        })
+
+    photo_base64 = detect_and_crop_photo_ocr(page1)
+
+    return {
+        "farmer_id": farmer_id,
+        "name_en": name_en,
+        "name_mr": name_mr,
+        "dob": dob,
+        "gender": gender,
+        "mobile": mobile,
+        "aadhaar_no": "",
+        "address_en": address_en,
+        "address_mr": address_mr,
+        "land_records": land_records,
+        "photo_base64": photo_base64
+    }
+
+# ----------------- 6. LOCAL PORTAL BACKGROUND AUTOMATION -----------------
 
 def fetch_farmer_data_from_portal(aadhaar_number):
     with sync_playwright() as p:
@@ -238,27 +471,62 @@ def fetch_farmer_data_from_portal(aadhaar_number):
 
         land_records = []
         try:
-            page.evaluate("window.scrollBy(0, 600)")
-            time.sleep(1)
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(2)
 
             rows = page.locator("table tbody tr")
-            for i in range(rows.count()):
-                cols = rows.nth(i).locator("td")
-                if cols.count() >= 6:
-                    d_raw = cols.nth(2).inner_text().strip()
-                    t_raw = cols.nth(3).inner_text().strip()
-                    v_raw = cols.nth(4).inner_text().strip()
-                    s_raw = cols.nth(5).inner_text().strip()
+            if rows.count() > 0:
+                for i in range(rows.count()):
+                    cols = rows.nth(i).locator("td")
+                    if cols.count() >= 6:
+                        d_raw = cols.nth(2).inner_text().strip()
+                        t_raw = cols.nth(3).inner_text().strip()
+                        v_raw = cols.nth(4).inner_text().strip()
+                        s_raw = cols.nth(5).inner_text().strip()
 
-                    area_val = "0.46"
-                    for col_idx in range(6, cols.count()):
-                        c_txt = cols.nth(col_idx).inner_text().strip()
-                        if re.match(r"^\d+\.\d+$", c_txt):
-                            try:
-                                area_val = f"{float(c_txt):.2f}"
-                            except ValueError:
-                                area_val = c_txt
-                            break
+                        area_val = "0.46"
+                        for c_idx in range(6, cols.count()):
+                            c_txt = cols.nth(c_idx).inner_text().strip()
+                            area_match = re.search(r"(\d+\.\d{2,6})", c_txt)
+                            if area_match:
+                                try:
+                                    area_val = f"{float(area_match.group(1)):.2f}"
+                                except ValueError:
+                                    area_val = area_match.group(1)
+                                break
+
+                        d_mr = "अहिल्यानगर" if "AHILYA" in d_raw.upper() else d_raw
+                        t_mr = "संगमनेर" if "SANGAM" in t_raw.upper() else t_raw
+                        v_mr = "अकलापूर" if "AKALAP" in v_raw.upper() else v_raw
+
+                        if s_raw and s_raw != "*":
+                            land_records.append({
+                                "district": d_mr or "-",
+                                "taluka": t_mr or "-",
+                                "village": v_mr or "-",
+                                "survey_no": s_raw,
+                                "khata_no": "-",
+                                "area": area_val
+                            })
+
+            if not land_records:
+                body_dump = page.inner_text("body")
+                land_match = re.search(
+                    r"MAHARASHTRA[\t\s]+([^\t\n\r]+)[\t\s]+([^\t\n\r]+)[\t\s]+([^\t\n\r]+)[\t\s]+(\d+)[\t\s]+\*[\t\s\S]*?(\d+\.\d{2,6})",
+                    body_dump,
+                    re.IGNORECASE
+                )
+                if land_match:
+                    d_raw = land_match.group(1).strip()
+                    t_raw = land_match.group(2).strip()
+                    v_raw = land_match.group(3).strip()
+                    s_raw = land_match.group(4).strip()
+                    raw_area = land_match.group(5).strip()
+
+                    try:
+                        area_val = f"{float(raw_area):.2f}"
+                    except ValueError:
+                        area_val = raw_area
 
                     d_mr = "अहिल्यानगर" if "AHILYA" in d_raw.upper() else d_raw
                     t_mr = "संगमनेर" if "SANGAM" in t_raw.upper() else t_raw
@@ -268,15 +536,16 @@ def fetch_farmer_data_from_portal(aadhaar_number):
                         "district": d_mr,
                         "taluka": t_mr,
                         "village": v_mr,
-                        "survey_no": s_raw or "-",
+                        "survey_no": s_raw,
                         "khata_no": "-",
                         "area": area_val
                     })
+
         except Exception:
             pass
 
         if not land_records:
-            land_records.append({"district": "", "taluka": "", "village": "", "survey_no": "", "khata_no": "-", "area": ""})
+            land_records.append({"district": "-", "taluka": "-", "village": "-", "survey_no": "-", "khata_no": "-", "area": "-"})
 
         context.close()
 
@@ -294,7 +563,7 @@ def fetch_farmer_data_from_portal(aadhaar_number):
             "photo_base64": photo_b64
         }
 
-# ----------------- 4. HTML CARD GENERATOR -----------------
+# ----------------- 7. HTML CARD GENERATOR -----------------
 
 def get_cards_page_html(data):
     photo_tag = f'<img src="data:image/jpeg;base64,{data["photo_base64"]}" style="width:100%; height:100%; object-fit:cover; display:block;" />' if data.get("photo_base64") else '<div style="background:#eee;width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#666;">No Photo</div>'
@@ -389,11 +658,14 @@ def get_cards_page_html(data):
     </body></html>
     """
 
-# ----------------- 5. RENDER ENGINE -----------------
+# ----------------- 8. RENDER ENGINE -----------------
 
 def render_cards_fast(html_content):
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu", "--single-process"])
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process"]
+        )
         page = browser.new_page(viewport={"width": 600, "height": 1100}, device_scale_factor=2)
         page.set_content(html_content, wait_until="networkidle")
         page.evaluate("document.fonts.ready")
@@ -403,33 +675,106 @@ def render_cards_fast(html_content):
         browser.close()
         return front_prev, front_clean, back
 
-# ----------------- 6. UI FLOW -----------------
+# ----------------- 9. UI FLOW (CLOUD & LOCAL MODES) -----------------
 
-st.title("🌾 Agri Farmer ID Portal (Automated Live Fetch)")
+st.title("🌾 Agri Farmer ID Portal & Card Generator")
 
-col_input, col_action = st.columns([3, 1])
-with col_input:
-    input_aadhaar = st.text_input("Enter 12-Digit Number", placeholder="Enter number", max_chars=14)
-with col_action:
-    st.write("")
-    st.write("")
-    btn_fetch = st.button("🚀 Fetch Details from AgriStack", use_container_width=True)
+# Check if query params passed data from Chrome extension
+query_params = st.query_params
+if "ext_data" in query_params and st.session_state["extracted_data"] is None:
+    try:
+        import json, urllib.parse
+        raw_json = urllib.parse.unquote(query_params["ext_data"])
+        st.session_state["extracted_data"] = json.loads(raw_json)
+        st.success("Data imported directly from AgriStack Portal!")
+    except Exception:
+        pass
 
-if btn_fetch:
-    clean_val = input_aadhaar.replace(" ", "")
-    if not clean_val or len(clean_val) != 12:
-        st.error("Please enter a valid 12-digit number.")
-    else:
-        with st.spinner("Connecting to AgriStack via CSC session..."):
-            extracted = fetch_farmer_data_from_portal(clean_val)
-            st.session_state["extracted_data"] = extracted
-            html = get_cards_page_html(extracted)
-            p_prev, p_clean, p_back = render_cards_fast(html)
-            st.session_state["card_front_preview"] = p_prev
-            st.session_state["card_front_clean"] = p_clean
-            st.session_state["card_back"] = p_back
-            st.success("Details and photo fetched successfully from AgriStack!")
+if IS_CLOUD_ENV:
+    st.info("☁️ **Cloud Mode:** Upload your registration PDF or enter details below to generate print-ready cards.")
+    
+    uploaded_file = st.file_uploader("Upload AgriStack Registration PDF", type=["pdf"])
+    if uploaded_file is not None:
+        file_bytes = uploaded_file.getvalue()
+        if st.session_state["last_processed_file"] != uploaded_file.name:
+            with st.spinner("Extracting farmer data and land parcels..."):
+                parsed = parse_agristack_pdf(file_bytes)
+                st.session_state["extracted_data"] = parsed
+                st.session_state["last_processed_file"] = uploaded_file.name
+                st.session_state["card_front_preview"] = None
+                st.session_state["card_front_clean"] = None
+                st.session_state["card_back"] = None
 
+    if st.session_state["extracted_data"] is not None:
+        d = st.session_state["extracted_data"]
+        with st.form("card_edit_form"):
+            col_f, col_b = st.columns(2)
+            with col_f:
+                st.markdown("#### 🪪 Front Card Details")
+                v_fid = st.text_input("Farmer ID", value=d.get("farmer_id", ""))
+                v_nmr = st.text_input("नाव (Marathi Name)", value=d.get("name_mr", ""))
+                v_nen = st.text_input("Name in English", value=d.get("name_en", ""))
+                v_dob = st.text_input("Date of Birth", value=d.get("dob", ""))
+                v_gen = st.text_input("Gender", value=d.get("gender", "Male"))
+                v_mob = st.text_input("Mobile Number", value=d.get("mobile", ""))
+                v_adh = st.text_input("12-Digit Number", value=d.get("aadhaar_no", ""))
+            with col_b:
+                st.markdown("#### 🏡 Back Card Details")
+                v_amr = st.text_area("संपूर्ण पत्ता (Marathi)", value=d.get("address_mr", ""), height=70)
+                v_aen = st.text_area("Address (English)", value=d.get("address_en", ""), height=70)
+                st.markdown("##### 🌾 Land Parcels")
+                df_l = pd.DataFrame(d.get("land_records", []))
+                edited_df = st.data_editor(df_l, num_rows="dynamic", use_container_width=True)
+
+            btn_gen = st.form_submit_button("✨ Generate Cards", use_container_width=True)
+            if btn_gen:
+                with st.spinner("Rendering ID cards..."):
+                    final_data = {
+                        "farmer_id": v_fid or "-",
+                        "name_mr": v_nmr or "-",
+                        "name_en": v_nen or "-",
+                        "dob": v_dob or "-",
+                        "gender": v_gen or "-",
+                        "mobile": v_mob or "-",
+                        "aadhaar_no": v_adh,
+                        "address_mr": v_amr or "-",
+                        "address_en": v_aen or "-",
+                        "land_records": edited_df.to_dict(orient="records"),
+                        "photo_base64": d.get("photo_base64", "")
+                    }
+                    st.session_state["extracted_data"] = final_data
+                    html = get_cards_page_html(final_data)
+                    p_p, p_c, p_b = render_cards_fast(html)
+                    st.session_state["card_front_preview"] = p_p
+                    st.session_state["card_front_clean"] = p_c
+                    st.session_state["card_back"] = p_b
+
+else:
+    # LOCAL MODE: Automated live browser fetch
+    col_input, col_action = st.columns([3, 1])
+    with col_input:
+        input_aadhaar = st.text_input("Enter 12-Digit Number", placeholder="Enter number", max_chars=14)
+    with col_action:
+        st.write("")
+        st.write("")
+        btn_fetch = st.button("🚀 Fetch Details from AgriStack", use_container_width=True)
+
+    if btn_fetch:
+        clean_val = input_aadhaar.replace(" ", "")
+        if not clean_val or len(clean_val) != 12:
+            st.error("Please enter a valid 12-digit number.")
+        else:
+            with st.spinner("Connecting to AgriStack via local Chrome session..."):
+                extracted = fetch_farmer_data_from_portal(clean_val)
+                st.session_state["extracted_data"] = extracted
+                html = get_cards_page_html(extracted)
+                p_prev, p_clean, p_back = render_cards_fast(html)
+                st.session_state["card_front_preview"] = p_prev
+                st.session_state["card_front_clean"] = p_clean
+                st.session_state["card_back"] = p_back
+                st.success("Details and photo fetched successfully from AgriStack!")
+
+# Common Step: Display cards & A4 print buttons
 if st.session_state["card_front_preview"] is not None:
     d = st.session_state["extracted_data"]
     st.markdown("---")
@@ -444,13 +789,12 @@ if st.session_state["card_front_preview"] is not None:
     st.markdown("---")
     st.markdown("#### ⚡ Single-Click Print & Download Options")
 
-    # Generate print outputs
     a4_pdf = create_a4_printable_sheet(st.session_state["card_front_clean"], st.session_state["card_back"], as_pdf=True)
     a4_png = create_a4_printable_sheet(st.session_state["card_front_clean"], st.session_state["card_back"], as_pdf=False)
     cards_zip = make_zip(st.session_state["card_front_clean"], st.session_state["card_back"], d.get("farmer_id", "card"))
 
-    row1_c1, row1_c2, row1_c3 = st.columns(3)
-    with row1_c1:
+    r1, r2, r3 = st.columns(3)
+    with r1:
         st.download_button(
             "📄 Download A4 Sheet (Print-Ready PDF)",
             data=a4_pdf,
@@ -458,7 +802,7 @@ if st.session_state["card_front_preview"] is not None:
             mime="application/pdf",
             use_container_width=True
         )
-    with row1_c2:
+    with r2:
         st.download_button(
             "🖼️ Download A4 Sheet (High-Res PNG)",
             data=a4_png,
@@ -466,7 +810,7 @@ if st.session_state["card_front_preview"] is not None:
             mime="image/png",
             use_container_width=True
         )
-    with row1_c3:
+    with r3:
         st.download_button(
             "📦 Download Both Cards (ZIP Archive)",
             data=cards_zip,
